@@ -1,0 +1,34 @@
+
+{
+  "monochrome": true,
+  "variant": "dark",
+  "styles": [
+    {
+      "id": "infrastructure",
+      "label": {
+        "visible": false
+      }
+    },
+    {
+      "id": "natural",
+      "label": {
+        "visible": false
+      }
+    },
+    {
+      "id": "pointOfInterest",
+      "label": {
+        "visible": false
+      }
+    },
+    {
+      "id": "political",
+      "geometry": {
+        "visible": false
+      },
+      "label": {
+        "visible": false
+      }
+    }
+  ]
+}
