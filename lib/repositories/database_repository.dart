@@ -17,6 +17,8 @@ class DatabaseRepository {
 
   // DBインスタンスのキャッシュ (開いたDBを再利用)
   final Map<DBKey, Database> _openDatabases = {};
+  // DBのモードキャッシュ (true=readOnly, false=writable)
+  final Map<DBKey, bool> _openDbModes = {};
 
   /// データベースディレクトリのパスを取得
   Future<String> get _dbDirectoryPath async {
@@ -31,31 +33,40 @@ class DatabaseRepository {
     // キャッシュチェック
     if (_openDatabases.containsKey(key)) {
       final db = _openDatabases[key]!;
-      if (db.isOpen) return db;
-      _openDatabases.remove(key); // 閉じていたら削除
+      final currentMode = _openDbModes[key] ?? true; // デフォルトはreadOnlyと仮定
+
+      if (db.isOpen) {
+        // 要求がWritable(readOnly=false)なのに、キャッシュがReadOnlyの場合は開き直す
+        if (!readOnly && currentMode) {
+          // 閉じて作り直し
+          await db.close();
+          _openDatabases.remove(key);
+          _openDbModes.remove(key);
+        } else {
+          // そのまま使える (ReadOnly要求ならWritableでもOK、Writable要求ならWritableのみ)
+          return db;
+        }
+      } else {
+        _openDatabases.remove(key);
+        _openDbModes.remove(key);
+      }
     }
 
     final file = File(path);
     if (!await file.exists()) {
       if (readOnly) {
-        // 読み取り専用でファイルが無ければnullを返す
         return null;
       }
-      // 書き込みモードなら新規作成されるが、ここでは単純化のため、
-      // 既存DBへの書き込みとみなし、存在しない場合のハンドリングは呼び出し元に任せる動きも可能。
-      // ただし、sqfliteのopenDatabaseはファイルが無ければ作成する。
     }
 
     try {
       final db = await openDatabase(
         path,
         readOnly: readOnly,
-        // 読み取り専用時はバージョンチェックを行わせない (書き込みが発生してエラーになるのを防ぐ)
         version: readOnly ? null : 1,
         onCreate: readOnly
             ? null
             : (db, version) async {
-                // 新規作成時のスキーマ定義 (必要に応じて)
                 await db.execute(
                     'CREATE TABLE IF NOT EXISTS heatmap_table (lat INTEGER, lng INTEGER, val INTEGER, tm INTEGER, p1 INTEGER, PRIMARY KEY (lat, lng))');
                 await db.execute(
@@ -63,6 +74,7 @@ class DatabaseRepository {
               },
       );
       _openDatabases[key] = db;
+      _openDbModes[key] = readOnly;
       return db;
     } catch (e) {
       debugPrint('Error opening database $key: $e');
@@ -214,5 +226,133 @@ class DatabaseRepository {
       await db.close();
     }
     _openDatabases.clear();
+  }
+
+  /// 指定された時間範囲に含まれるセルを全DBから検索して取得 (Zoom 14 と仮定)
+  Future<List<Cell>> fetchCellsByTimeRange(int startTime, int endTime) async {
+    List<Cell> results = [];
+    final dbDirPath = await _dbDirectoryPath;
+    final dbDir = Directory(dbDirPath);
+    if (!await dbDir.exists()) {
+      debugPrint('DB Directory not found: $dbDirPath');
+      return [];
+    }
+
+    final files = dbDir.listSync();
+    debugPrint('Found ${files.length} files in DB directory.');
+
+    // 時間範囲を正規化
+    final int start = min(startTime, endTime);
+    final int end = max(startTime, endTime);
+
+    // 正規表現でファイル名をパース: hm_14_{lat}_{lng}.db または .sqlite
+    final RegExp shardPattern = RegExp(r'^hm_14_(-?\d+)_(-?\d+)\.(db|sqlite)$');
+
+    for (var f in files) {
+      if (f is! File) continue;
+
+      final name = p.basename(f.path);
+      final match = shardPattern.firstMatch(name);
+
+      if (match != null) {
+        // Zoom 14 のシャードのみ対象
+        try {
+          final db = await openDatabase(f.path, readOnly: true);
+          final List<Map<String, dynamic>> res = await db.query(
+            'heatmap_table',
+            where: 'tm >= ? AND tm <= ?',
+            whereArgs: [start, end],
+          );
+
+          if (res.isNotEmpty) {
+            debugPrint('Found ${res.length} cells in ${f.path}');
+          }
+
+          for (final row in res) {
+            results.add(Cell.fromSqlite(row));
+          }
+          await db.close();
+        } catch (e) {
+          debugPrint('Error querying DB ${f.path}: $e');
+        }
+      }
+    }
+    debugPrint('Total cells found in range: ${results.length}');
+    return results;
+  }
+
+  /// 区間削除等のための削除処理
+  /// [targetCells] は Zoom 14 のセルリストと仮定
+  Future<void> deleteCells(List<Cell> targetCells) async {
+    const int baseZ = 14;
+
+    for (final cell in targetCells) {
+      // 1. MinUnit (Zoom 14) の削除
+      // ターゲット自体を削除 (val=0扱い、レコード削除)
+      await _updateCellVal(baseZ, cell.lat, cell.lng, 0, forceDelete: true);
+
+      // 2. 親セル (Zoom 3-13) の減算
+      for (int z = 3; z < baseZ; z++) {
+        // 親の座標計算: 2^(14-z) で割る
+        final double divisor = pow(2, baseZ - z).toDouble();
+        final int parentLat = (cell.lat / divisor).floor();
+        final int parentLng = (cell.lng / divisor).floor();
+
+        await _decrementCellVal(z, parentLat, parentLng, cell.val);
+      }
+    }
+  }
+
+  /// 指定座標のセルの値を更新 (0以下なら削除)
+  Future<void> _updateCellVal(int z, int lat, int lng, int newVal,
+      {bool forceDelete = false}) async {
+    final dbLat = lat ~/ 1000;
+    final dbLng = lng ~/ 1000;
+    final key = DBKey(z, dbLat, dbLng);
+
+    // 書き込みモードで開く
+    final db = await openDB(key, readOnly: false);
+    if (db == null) return;
+
+    if (newVal <= 0 || forceDelete) {
+      await db.delete('heatmap_table',
+          where: 'lat = ? AND lng = ?', whereArgs: [lat, lng]);
+    } else {
+      // update用：存在しない場合はInsertも考慮すべきだが、
+      // 今回のフローでは「存在するセルの値を減らす」のがメインなのでUpdateのみ。
+      // もしInsertが必要なら別途実装。
+      await db.update('heatmap_table', {'val': newVal},
+          where: 'lat = ? AND lng = ?', whereArgs: [lat, lng]);
+    }
+  }
+
+  /// 指定セルから値を引く
+  Future<void> _decrementCellVal(int z, int lat, int lng, int diff) async {
+    final dbLat = lat ~/ 1000;
+    final dbLng = lng ~/ 1000;
+    final key = DBKey(z, dbLat, dbLng);
+    final db = await openDB(key, readOnly: false);
+    if (db == null) return;
+
+    try {
+      final List<Map<String, dynamic>> res = await db.query('heatmap_table',
+          columns: ['val'],
+          where: 'lat = ? AND lng = ?',
+          whereArgs: [lat, lng]);
+
+      if (res.isNotEmpty) {
+        int currentVal = res.first['val'] as int;
+        int nextVal = currentVal - diff;
+        if (nextVal <= 0) {
+          await db.delete('heatmap_table',
+              where: 'lat = ? AND lng = ?', whereArgs: [lat, lng]);
+        } else {
+          await db.update('heatmap_table', {'val': nextVal},
+              where: 'lat = ? AND lng = ?', whereArgs: [lat, lng]);
+        }
+      }
+    } catch (e) {
+      debugPrint('Error decrementing cell: $e');
+    }
   }
 }

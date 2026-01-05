@@ -39,4 +39,15 @@ class Cell {
 
   @override
   String toString() => 'Cell(lat: $lat, lng: $lng, val: $val)';
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is Cell &&
+          runtimeType == other.runtimeType &&
+          lat == other.lat &&
+          lng == other.lng;
+
+  @override
+  int get hashCode => lat.hashCode ^ lng.hashCode;
 }

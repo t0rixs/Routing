@@ -23,6 +23,15 @@ class MapViewModel extends ChangeNotifier {
   // タイル更新用カウンタ to force refresh
   int _tileOverlayCounter = 0;
 
+  // --- Delete Section Mode State ---
+  bool isDeleteSectionMode = false;
+  bool isDeleteReady = false;
+  Cell? _deleteSectionStartCell;
+  Set<Cell> _highlightCells = {};
+  Set<Cell> get highlightCells => _highlightCells;
+  // Cache for mult-zoom highlighting: Key=ZoomLevel, Value=Set of "lat_lng" strings
+  Map<int, Set<String>> _highlightCache = {};
+
   void onMapCreated(GoogleMapController controller) {
     _refreshTileOverlay();
   }
@@ -48,6 +57,127 @@ class MapViewModel extends ChangeNotifier {
   /// 外部からリフレッシュを要求する
   void refreshMap() {
     _refreshTileOverlay();
+  }
+
+  // --- Delete Section Logic ---
+
+  void startDeleteSectionMode(Cell cell) {
+    isDeleteSectionMode = true;
+    _deleteSectionStartCell = cell;
+    isDeleteReady = false;
+    _deleteSectionStartCell = cell;
+    isDeleteReady = false;
+    _highlightCells = {};
+    _highlightCache.clear();
+    _refreshTileOverlay(); // ハイライトクリアのため念のため
+    notifyListeners();
+  }
+
+  void cancelDeleteSectionMode() {
+    isDeleteSectionMode = false;
+    _deleteSectionStartCell = null;
+    isDeleteReady = false;
+    _highlightCells = {};
+    _highlightCache.clear();
+    _refreshTileOverlay();
+    notifyListeners();
+  }
+
+  Future<void> executeDeleteSection() async {
+    if (_highlightCells.isEmpty) return;
+
+    await _databaseRepository.deleteCells(_highlightCells.toList());
+
+    // 完了処理
+    cancelDeleteSectionMode();
+    _refreshTileOverlay();
+  }
+
+  Future<void> _handleDeleteSectionSelection(Cell cellB) async {
+    final cellA = _deleteSectionStartCell!;
+
+    // 比較候補
+    final int atm = cellA.tm;
+    // p1がnullまたは0以下の場合は比較対象外とする
+    final int? ap1 = (cellA.p1 != null && cellA.p1! > 0) ? cellA.p1 : null;
+
+    final int btm = cellB.tm;
+    final int? bp1 = (cellB.p1 != null && cellB.p1! > 0) ? cellB.p1 : null;
+
+    int diff(int? v1, int? v2) {
+      if (v1 == null || v2 == null) return 9223372036854775807; // int64 max
+      return (v1 - v2).abs();
+    }
+
+    // 4パターン計算
+    final d1 = diff(atm, btm); // Atm - Btm
+    final d2 = diff(atm, bp1); // Atm - Bp1
+    final d3 = diff(ap1, btm); // Ap1 - Btm
+    final d4 = diff(ap1, bp1); // Ap1 - Bp1
+
+    // 最小を探す
+    if (d1 <= d2 && d1 <= d3 && d1 <= d4) {
+      debugPrint('Selected Range: Atm($atm) - Btm($btm) (Diff: $d1)');
+      // startT, endT determined later
+    } else if (d2 <= d1 && d2 <= d3 && d2 <= d4) {
+      debugPrint('Selected Range: Atm($atm) - Bp1($bp1) (Diff: $d2)');
+    } else if (d3 <= d1 && d3 <= d2 && d3 <= d4) {
+      debugPrint('Selected Range: Ap1($ap1) - Btm($btm) (Diff: $d3)');
+    } else {
+      debugPrint('Selected Range: Ap1($ap1) - Bp1($bp1) (Diff: $d4)');
+    }
+
+    // 値の決定（上記の判定を再利用して値をセット）
+    int startT, endT;
+    if (d1 <= d2 && d1 <= d3 && d1 <= d4) {
+      startT = atm;
+      endT = btm;
+    } else if (d2 <= d1 && d2 <= d3 && d2 <= d4) {
+      startT = atm;
+      endT = bp1!;
+    } else if (d3 <= d1 && d3 <= d2 && d3 <= d4) {
+      startT = ap1!;
+      endT = btm;
+    } else {
+      startT = ap1!;
+      endT = bp1!;
+    }
+
+    // 開始終了が逆転している場合の補正は fetchCellsByTimeRange 内の min/max で行われるが念のため確認
+    debugPrint('Searching Time Range: $startT - $endT');
+
+    // 範囲検索
+    // startT, endT の間のセルを取得
+    // どちらが過去かわからないので fetchCellsByTimeRange 内で min/max 処理される
+    final cells = await _databaseRepository.fetchCellsByTimeRange(startT, endT);
+
+    _highlightCells = cells.toSet();
+    _updateHighlightCache(); // Highlight cache update
+    isDeleteReady = true;
+    _refreshTileOverlay(); // ハイライト描画のため
+    notifyListeners();
+  }
+
+  /// _highlightCells (Zoom 14 state) based, create cache for parents
+  void _updateHighlightCache() {
+    _highlightCache.clear();
+    for (int z = 3; z <= 14; z++) {
+      _highlightCache[z] = {};
+    }
+
+    const int baseZ = 14;
+    for (final cell in _highlightCells) {
+      // Zoom 14 -> add itself
+      _highlightCache[14]!.add('${cell.lat}_${cell.lng}');
+
+      // Zoom 3..13 -> add parent
+      for (int z = 3; z < baseZ; z++) {
+        final double divisor = pow(2, baseZ - z).toDouble();
+        final int parentLat = (cell.lat / divisor).floor();
+        final int parentLng = (cell.lng / divisor).floor();
+        _highlightCache[z]!.add('${parentLat}_${parentLng}');
+      }
+    }
   }
 
   // --- Helpers: Web Mercator forward + cell rect in this tile ---
@@ -127,6 +257,26 @@ class MapViewModel extends ChangeNotifier {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 0.5;
       canvas.drawRect(r, paintStroke);
+
+      // ハイライト描画 (区間削除モード用)
+      if (isDeleteSectionMode) {
+        bool shouldHighlight = false;
+        // Check cache
+        if (_highlightCache.containsKey(cellZ)) {
+          final key = '${cell.lat}_${cell.lng}';
+          if (_highlightCache[cellZ]!.contains(key)) {
+            shouldHighlight = true;
+          }
+        }
+
+        if (shouldHighlight) {
+          final paintHighlight = Paint()
+            ..color = Colors.red
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2.0; // Zoomレベルに応じて太さを調整しても良い
+          canvas.drawRect(r, paintHighlight);
+        }
+      }
     }
 
     return _finishTile(recorder, ts);
@@ -179,7 +329,17 @@ class MapViewModel extends ChangeNotifier {
 
     debugPrint('onTap: $latLng -> Index($latIndex, $lngIndex)');
 
-    return await _databaseRepository.getCell(targetZ, latIndex, lngIndex);
+    final cell = await _databaseRepository.getCell(targetZ, latIndex, lngIndex);
+
+    if (isDeleteSectionMode) {
+      if (cell != null) {
+        // 2点目(B)の選択処理
+        await _handleDeleteSectionSelection(cell);
+      }
+      return null; // 詳細ダイアログを出さないようにnullを返す
+    }
+
+    return cell;
   }
 }
 
