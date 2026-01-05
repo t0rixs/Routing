@@ -283,8 +283,11 @@ class DatabaseRepository {
 
   /// 区間削除等のための削除処理
   /// [targetCells] は Zoom 14 のセルリストと仮定
-  Future<void> deleteCells(List<Cell> targetCells) async {
+  Future<void> deleteCells(List<Cell> targetCells,
+      {Function(int, int)? onProgress}) async {
     const int baseZ = 14;
+    int processedCount = 0;
+    int totalCount = targetCells.length;
 
     for (final cell in targetCells) {
       // 1. MinUnit (Zoom 14) の削除
@@ -299,6 +302,11 @@ class DatabaseRepository {
         final int parentLng = (cell.lng / divisor).floor();
 
         await _decrementCellVal(z, parentLat, parentLng, cell.val);
+      }
+
+      processedCount++;
+      if (onProgress != null) {
+        onProgress(processedCount, totalCount);
       }
     }
   }

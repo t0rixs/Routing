@@ -101,7 +101,7 @@ class MapWidget extends StatelessWidget {
                                 builder: (ctx) => AlertDialog(
                                   title: const Text('区間削除'),
                                   content: Text(
-                                      '選択された範囲のデータを削除しますか？\n対象セル数: ${viewModel.highlightCells.length}'),
+                                      '選択された範囲のデータを削除しますか？\nこの操作は取り消せません。\n対象セル数: ${viewModel.highlightCells.length}'),
                                   actions: [
                                     TextButton(
                                         child: const Text('キャンセル'),
@@ -111,7 +111,7 @@ class MapWidget extends StatelessWidget {
                                         child: const Text('実行',
                                             style:
                                                 TextStyle(color: Colors.red)),
-                                        onPressed: () async {
+                                        onPressed: () {
                                           Navigator.of(ctx)
                                               .pop(); // 確認ダイアログを閉じる
 
@@ -120,40 +120,11 @@ class MapWidget extends StatelessWidget {
                                             context: context,
                                             barrierDismissible: false,
                                             builder: (BuildContext context) {
-                                              return const Center(
-                                                child:
-                                                    CircularProgressIndicator(),
+                                              return _ProgressDialogContent(
+                                                viewModel: viewModel,
                                               );
                                             },
                                           );
-
-                                          // 削除実行
-                                          await viewModel
-                                              .executeDeleteSection();
-
-                                          if (context.mounted) {
-                                            Navigator.of(context)
-                                                .pop(); // 処理中ダイアログを閉じる
-                                          }
-
-                                          if (context.mounted) {
-                                            // 完了ダイアログを表示
-                                            showDialog(
-                                              context: context,
-                                              builder: (ctx) => AlertDialog(
-                                                title: const Text('削除完了'),
-                                                content:
-                                                    const Text('区間の削除が完了しました。'),
-                                                actions: [
-                                                  TextButton(
-                                                    child: const Text('OK'),
-                                                    onPressed: () =>
-                                                        Navigator.of(ctx).pop(),
-                                                  ),
-                                                ],
-                                              ),
-                                            );
-                                          }
                                         }),
                                   ],
                                 ),
@@ -172,6 +143,78 @@ class MapWidget extends StatelessWidget {
           ],
         );
       },
+    );
+  }
+}
+
+class _ProgressDialogContent extends StatefulWidget {
+  final MapViewModel viewModel;
+  const _ProgressDialogContent({required this.viewModel});
+
+  @override
+  State<_ProgressDialogContent> createState() => _ProgressDialogContentState();
+}
+
+class _ProgressDialogContentState extends State<_ProgressDialogContent> {
+  int _current = 0;
+  int _total = 1;
+
+  @override
+  void initState() {
+    super.initState();
+    _startDeletion();
+  }
+
+  Future<void> _startDeletion() async {
+    _total = widget.viewModel.highlightCells.length;
+    if (_total == 0) _total = 1;
+
+    await widget.viewModel.executeDeleteSection(
+      onProgress: (current, total) {
+        if (mounted) {
+          setState(() {
+            _current = current;
+            _total = total;
+          });
+        }
+      },
+    );
+
+    if (mounted) {
+      Navigator.of(context).pop(); // Close progress dialog
+
+      // Show completion dialog
+      showDialog(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('削除完了'),
+          content: const Text('区間の削除が完了しました。'),
+          actions: [
+            TextButton(
+              child: const Text('OK'),
+              onPressed: () => Navigator.of(ctx).pop(),
+            ),
+          ],
+        ),
+      );
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // Prevent division by zero
+    double progress = (_total > 0) ? _current / _total : 0.0;
+
+    return AlertDialog(
+      title: const Text('削除実行中'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          LinearProgressIndicator(value: progress),
+          const SizedBox(height: 10),
+          Text('$_current / $_total'),
+        ],
+      ),
     );
   }
 }

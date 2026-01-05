@@ -83,10 +83,11 @@ class MapViewModel extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> executeDeleteSection() async {
+  Future<void> executeDeleteSection({Function(int, int)? onProgress}) async {
     if (_highlightCells.isEmpty) return;
 
-    await _databaseRepository.deleteCells(_highlightCells.toList());
+    await _databaseRepository.deleteCells(_highlightCells.toList(),
+        onProgress: onProgress);
 
     // 完了処理
     cancelDeleteSectionMode();
