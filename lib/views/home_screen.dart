@@ -10,13 +10,6 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: const Text('Routing App (MVVM)'),
-        backgroundColor: Colors.transparent,
-        elevation: 0,
-        // Drawerアイコンは自動で付くが、FABでメニューを開くならAppBarは非表示でも良い。
-        // ここでは標準的なDrawer使用とする。
-      ),
       drawer: const MenuDrawer(),
       body: Stack(
         children: [

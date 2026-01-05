@@ -1,12 +1,11 @@
 import 'dart:async';
 import 'dart:math';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
-import '../repositories/database_repository.dart';
 import '../models/cell.dart';
+import '../repositories/database_repository.dart';
 
 /// マップの表示状態とデータロードを管理するViewModel
 class MapViewModel extends ChangeNotifier {
@@ -51,6 +50,19 @@ class MapViewModel extends ChangeNotifier {
     _refreshTileOverlay();
   }
 
+  // --- Helpers: Web Mercator forward + cell rect in this tile ---
+  Point<double> latLngToWorldPixel(
+      double latDeg, double lngDeg, int z, int ts) {
+    final double n = pow(2, z).toDouble(); // 2^z tiles per axis
+    // X: linear in longitude
+    final double worldPixelX = ((lngDeg + 180.0) / 360.0) * n * ts.toDouble();
+    // Y: Web Mercator (non-linear)
+    final double latRad = latDeg * pi / 180.0;
+    final double yTile = (1 - log(tan(pi / 4 + latRad / 2)) / pi) / 2 * n;
+    final double worldPixelY = yTile * ts.toDouble();
+    return Point(worldPixelX, worldPixelY);
+  }
+
   /// タイルの画像データを生成して返すメソッド
   Future<Tile> getTile(int tileX, int tileY, int? zoomDesc) async {
     const int ts = 512;
@@ -58,24 +70,6 @@ class MapViewModel extends ChangeNotifier {
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
-
-    // デバッグ用: タイル座標とZoomレベルを描画 (不要ならコメントアウト可能)
-    // final textPainter = TextPainter(
-    //   text: TextSpan(
-    //     text: 'x:$tileX y:$tileY\nzoom:$zoomDesc',
-    //     style: const TextStyle(color: Colors.black, fontSize: 12),
-    //   ),
-    //   textDirection: TextDirection.ltr,
-    // );
-    // textPainter.layout();
-    // textPainter.paint(canvas, const Offset(10, 10));
-
-    // タイル境界線 (デバッグ用)
-    // final borderPaint = Paint()
-    //   ..color = Colors.blue.withOpacity(0.3)
-    //   ..style = PaintingStyle.stroke
-    //   ..strokeWidth = 1;
-    // canvas.drawRect(Rect.fromLTWH(0, 0, ts.toDouble(), ts.toDouble()), borderPaint);
 
     if (zoomDesc == null) {
       return _finishTile(recorder, ts);
@@ -93,24 +87,12 @@ class MapViewModel extends ChangeNotifier {
       return _finishTile(recorder, ts);
     }
 
-    // --- Helpers: Web Mercator forward + cell rect in this tile ---
-    Point<double> latLngToWorldPixel(double latDeg, double lngDeg, int z) {
-      final double n = pow(2, z).toDouble(); // 2^z tiles per axis
-      // X: linear in longitude
-      final double worldPixelX = ((lngDeg + 180.0) / 360.0) * n * ts.toDouble();
-      // Y: Web Mercator (non-linear)
-      final double latRad = latDeg * pi / 180.0;
-      final double yTile = (1 - log(tan(pi / 4 + latRad / 2)) / pi) / 2 * n;
-      final double worldPixelY = yTile * ts.toDouble();
-      return Point(worldPixelX, worldPixelY);
-    }
-
     Rect cellRectInThisTile(int latIndex, int lngIndex) {
       final LatLngBounds b = _cellToLatLngBounds(cellZ, latIndex, lngIndex);
       final Point<double> sw = latLngToWorldPixel(
-          b.southwest.latitude, b.southwest.longitude, tileZ);
+          b.southwest.latitude, b.southwest.longitude, tileZ, ts);
       final Point<double> ne = latLngToWorldPixel(
-          b.northeast.latitude, b.northeast.longitude, tileZ);
+          b.northeast.latitude, b.northeast.longitude, tileZ, ts);
 
       // Convert to tile-local pixels (origin at this tile's top-left)
       final double pxW = sw.x - tileX * ts.toDouble();
@@ -139,12 +121,12 @@ class MapViewModel extends ChangeNotifier {
         ..style = PaintingStyle.fill;
       canvas.drawRect(r, paintFill);
 
-      // 枠線は処理負荷軽減のためOFFにするか、薄く描画
-      // final paintStroke = Paint()
-      //   ..color = color
-      //   ..style = PaintingStyle.stroke
-      //   ..strokeWidth = 0.4;
-      // canvas.drawRect(r, paintStroke);
+      // ストローク (枠線)
+      final paintStroke = Paint()
+        ..color = Colors.black.withValues(alpha: 0.3) // 色を変更 (例: 黒の半透明)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 0.5;
+      canvas.drawRect(r, paintStroke);
     }
 
     return _finishTile(recorder, ts);
@@ -183,7 +165,21 @@ class MapViewModel extends ChangeNotifier {
     final double hue = 255 - (ratio * 255);
     return HSVColor.fromAHSV(1.0, hue, 1.0, 0.8)
         .toColor()
-        .withOpacity(0.6); // 透過度調整
+        .withValues(alpha: 0.6); // 透過度調整
+  }
+
+  Future<Cell?> onTap(LatLng latLng) async {
+    // タップした場所のcell情報を取得
+    // Zoom 14 固定 (データは基本的に14で格納されているか、インポート時に14相当に補正されている前提)
+    const int targetZ = 14;
+    final double cellSize = (0.0002 * pow(2, 14 - targetZ)).toDouble();
+
+    int latIndex = ((latLng.latitude + 90.0) / cellSize).floor();
+    int lngIndex = ((latLng.longitude + 180.0) / cellSize).floor();
+
+    debugPrint('onTap: $latLng -> Index($latIndex, $lngIndex)');
+
+    return await _databaseRepository.getCell(targetZ, latIndex, lngIndex);
   }
 }
 

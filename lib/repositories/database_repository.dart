@@ -123,6 +123,32 @@ class DatabaseRepository {
     return cells;
   }
 
+  /// 指定されたインデックスの単一セルを取得
+  Future<Cell?> getCell(int cellZ, int latIndex, int lngIndex) async {
+    try {
+      int dbLat = latIndex ~/ 1000;
+      int dbLng = lngIndex ~/ 1000;
+
+      final dbKey = DBKey(cellZ, dbLat, dbLng);
+      final db = await openDB(dbKey, readOnly: true);
+
+      if (db == null) return null;
+
+      final List<Map<String, dynamic>> res = await db.query(
+        'heatmap_table',
+        where: 'lat = ? AND lng = ?',
+        whereArgs: [latIndex, lngIndex],
+      );
+
+      if (res.isNotEmpty) {
+        return Cell.fromSqlite(res.first);
+      }
+    } catch (e) {
+      debugPrint('Error fetching specific cell: $e');
+    }
+    return null;
+  }
+
   /// DBから範囲内のセルを読み込む
   Future<void> _loadCellsFromDb(
       Database db, Set<Cell> cells, int s, int n, int w, int e) async {
