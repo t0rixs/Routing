@@ -84,6 +84,7 @@ class MenuDrawer extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.file_download),
             title: const Text('Export .mapping'),
+            subtitle: const Text('Android・iOS両対応'),
             onTap: () async {
               Navigator.pop(context); // Close drawer
 

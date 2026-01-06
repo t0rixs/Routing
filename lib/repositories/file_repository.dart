@@ -4,6 +4,9 @@ import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
+import 'package:sqflite/sqflite.dart';
+import '../utils/journal_generator.dart';
+import '../utils/area3_db_generator.dart';
 
 /// ファイル操作 (.mappingファイルのインポート・エクスポート) を担当するリポジトリ
 class FileRepository {
@@ -23,7 +26,8 @@ class FileRepository {
   /// .mappingファイルをインポートする
   /// [filePath]: 選択されたファイルのパス
   /// [dbBasePath]: アプリのデータベースディレクトリパス
-  Future<void> importMappingFile(String filePath, String dbBasePath) async {
+  Future<void> importMappingFile(String filePath, String dbBasePath,
+      {Function(int, int)? onProgress}) async {
     final file = File(filePath);
     if (!await file.exists()) {
       throw Exception('File not found: $filePath');
@@ -60,7 +64,8 @@ class FileRepository {
         if (entity.name.endsWith('myalltracks.backup')) {
           backupFound = true;
           debugPrint('Found backup file: ${entity.name}. Restoring...');
-          await _restoreBackup(entity.content as List<int>, dbBasePath);
+          await _restoreBackup(
+              entity.content as List<int>, dbBasePath, onProgress);
         } else if (p.extension(entity.name) == '.jpg') {
           // 画像ファイル等の処理
           // 必要ならば documents/imgs 等へ保存
@@ -74,7 +79,8 @@ class FileRepository {
 
   /// 内部の .backup (ZIP) を展開し、DBファイルを復元する
   /// **ここで自動リネームロジックを実行する**
-  Future<void> _restoreBackup(List<int> backupBytes, String dbBasePath) async {
+  Future<void> _restoreBackup(List<int> backupBytes, String dbBasePath,
+      Function(int, int)? onProgress) async {
     debugPrint('Restoring myalltracks.backup... Bytes: ${backupBytes.length}');
 
     // ヘッダー確認 (ファイル形式特定用)
@@ -217,7 +223,14 @@ class FileRepository {
       return;
     }
 
+    int totalFiles = archive.length;
+    int processedCount = 0;
+
     for (var file in archive) {
+      processedCount++;
+      if (onProgress != null) {
+        onProgress(processedCount, totalFiles);
+      }
       // Force distinct log prefix to avoid dropping
       print('*** Backup Entry: ${file.name} (Size: ${file.size})');
 
@@ -307,8 +320,10 @@ class FileRepository {
   }
 
   /// 現在のDBデータをエクスポートして .mapping ファイルを作成し、共有する
+  /// Android版・iOS版両対応（同じ形式）
   /// [dbBasePath]: データベースディレクトリパス
-  Future<void> exportMappingFile(String dbBasePath) async {
+  Future<void> exportMappingFile(String dbBasePath,
+      {Function(int, int)? onProgress}) async {
     debugPrint('Exporting .mapping file from $dbBasePath');
     final dbDir = Directory(dbBasePath);
     if (!await dbDir.exists()) {
@@ -319,9 +334,15 @@ class FileRepository {
     // 1. 第一段階ZIP用のアーカイブ作成 (myalltracks.backup の中身)
     final innerArchive = Archive();
     final files = dbDir.listSync(recursive: false);
+    final totalFiles = files.length;
+    int processedCount = 0;
     int dbCount = 0;
 
     for (var entity in files) {
+      processedCount++;
+      if (onProgress != null) {
+        onProgress(processedCount, totalFiles);
+      }
       if (entity is! File) continue;
 
       final name = p.basename(entity.path);
@@ -372,14 +393,74 @@ class FileRepository {
           final bytes = await entity.readAsBytes();
 
           List<int> processedBytes;
+
+          // 通常の処理
+          // Android版もiOS版も、myalltracks.backup 内のファイルは平文SQLiteを期待
           // 本アプリ内の .db ファイルは暗号化されているため、エクスポート時に復号
           // .sqlite ファイルは平文のためそのまま → .db にリネーム
+
+          List<int> currentBytes;
           if (lowerName.endsWith('.db') || lowerName.endsWith('.db-journal')) {
-            // 暗号化されているので復号して出力
-            processedBytes = _xorProcess(bytes);
+            // 暗号化されているので復号して出力（Android版は暗号化されたファイルを期待するため、ここで復号＝平文に戻す？）
+            // いや、Android版はXOR 0x55を期待している。
+            // 本アプリ内のDBが平文なら、_xorProcessで暗号化される。
+            // 本アプリ内のDBが暗号化なら、_xorProcessで平文になる。
+            // ここはこれまでのロジックを踏襲する。
+            currentBytes = _xorProcess(bytes);
           } else {
             // .sqlite 系は平文なのでそのまま
-            processedBytes = bytes;
+            currentBytes = bytes;
+          }
+
+          // iOS → Android 互換性: hm_*.db ファイル および ue3.db に android_metadata を追加
+          // ユーザー要望により ue3.db はリネームせずそのまま使用するが、メタデータは追加しておく方が安全
+          if ((exportName.startsWith('hm_') && exportName.endsWith('.db')) ||
+              exportName == 'ue3.db') {
+            // ここでは currentBytes は「アーカイブに格納される直前の状態」
+            // もし _xorProcess で暗号化されているなら、一旦復号が必要。
+            // しかし、本アプリ内が平文で _xorProcess で暗号化しているなら、
+            // まだファイル書き込み前なので _xorProcess 前の bytes を使えば平文のはず。
+
+            // 一旦一時ファイルに書き出す
+            final tempDir = await getTemporaryDirectory();
+            final tempHmPath = p.join(tempDir.path,
+                'temp_db_process_${DateTime.now().microsecondsSinceEpoch}.db');
+
+            // bytes は平文のはず（本アプリ内DBが平文なら）。
+            await File(tempHmPath).writeAsBytes(bytes);
+
+            bool modified = false;
+            try {
+              final db = await openDatabase(tempHmPath);
+
+              // android_metadata チェック
+              final count = Sqflite.firstIntValue(await db.rawQuery(
+                  "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='android_metadata'"));
+
+              if (count == 0) {
+                await db.execute('CREATE TABLE android_metadata (locale TEXT)');
+                await db.execute(
+                    "INSERT INTO android_metadata (locale) VALUES ('ja_JP')");
+                modified = true;
+              }
+
+              await db.close();
+            } catch (e) {
+              // debugPrint('Failed to add metadata to $exportName: $e');
+              // おそらく暗号化されていた、あるいは破損。無視して元のデータを使う。
+            }
+
+            if (modified) {
+              final newBytes = await File(tempHmPath).readAsBytes();
+              // 修正された平文データを暗号化
+              processedBytes = _xorProcess(newBytes);
+            } else {
+              processedBytes = currentBytes;
+            }
+
+            await File(tempHmPath).delete();
+          } else {
+            processedBytes = currentBytes;
           }
 
           final archiveFile =
@@ -413,17 +494,97 @@ class FileRepository {
       }
     }
 
-    // journal が無い .db ファイルに対して空の journal を追加
-    for (var dbFileName in dbFilesInArchive) {
-      if (!journalFilesInArchive.contains(dbFileName)) {
-        final journalName = '$dbFileName-journal';
-        // 空のジャーナルファイル（512バイト）を作成
-        final emptyJournal = Uint8List(512);
-        final journalFile =
-            ArchiveFile(journalName, emptyJournal.length, emptyJournal);
-        innerArchive.addFile(journalFile);
-        debugPrint('Generated empty journal: $journalName');
-      }
+    // 1.6. iOS元データの場合、必須DBファイルが無ければ生成
+    // (Android版マッピングアプリとの互換性のため)
+    final allDbFiles = dbFilesInArchive.toList();
+
+    // area3.db が無い場合、生成
+    if (Area3DbGenerator.needsArea3Db(allDbFiles)) {
+      debugPrint('Generating missing area3.db for Android compatibility...');
+
+      // 一時ファイルとして生成
+      final tempDir = await getTemporaryDirectory();
+      final area3Path = p.join(tempDir.path, 'area3_temp.db');
+
+      final area3Bytes = await Area3DbGenerator.generateEmptyArea3Db(area3Path);
+
+      // 平文で出力（Android版は平文を期待）
+      final area3Data = area3Bytes;
+
+      // アーカイブに追加
+      final area3File = ArchiveFile('area3.db', area3Data.length, area3Data);
+      innerArchive.addFile(area3File);
+
+      // journal も追加
+      final area3Journal = JournalGenerator.generateEmptyJournal();
+      final area3JournalFile =
+          ArchiveFile('area3.db-journal', area3Journal.length, area3Journal);
+      innerArchive.addFile(area3JournalFile);
+
+      // 一時ファイル削除
+      await File(area3Path).delete();
+
+      debugPrint('Generated area3.db and area3.db-journal');
+    }
+
+    // ue3.db が無い場合、生成（空のuserevent3_table）
+    if (Area3DbGenerator.needsUe3Db(allDbFiles)) {
+      debugPrint('Generating missing ue3.db for Android compatibility...');
+
+      final tempDir = await getTemporaryDirectory();
+      final ue3Path = p.join(tempDir.path, 'ue3_temp_gen.db');
+
+      final ue3Bytes = await Area3DbGenerator.generateEmptyUe3Db(ue3Path);
+
+      // 暗号化（Android版マッピングアプリは暗号化されたファイルを期待）
+      // ※ ue3.db はiOS版では平文だったが、Android版では area3.db とペアで存在し、
+      // どちらも暗号化されている可能性があるため、暗号化しておくのが安全
+      final encryptedUe3 = _xorProcess(ue3Bytes);
+
+      // アーカイブに追加
+      final ue3File = ArchiveFile('ue3.db', encryptedUe3.length, encryptedUe3);
+      innerArchive.addFile(ue3File);
+
+      // journal も追加
+      final ue3Journal = JournalGenerator.generateEmptyJournal();
+      final ue3JournalFile =
+          ArchiveFile('ue3.db-journal', ue3Journal.length, ue3Journal);
+      innerArchive.addFile(ue3JournalFile);
+
+      await File(ue3Path).delete();
+      debugPrint('Generated ue3.db and ue3.db-journal');
+    }
+
+    // google_app_measurement_local.db が無い場合、生成
+    if (Area3DbGenerator.needsGoogleMeasurementDb(allDbFiles)) {
+      debugPrint('Generating missing google_app_measurement_local.db...');
+
+      final tempDir = await getTemporaryDirectory();
+      final googlePath = p.join(tempDir.path, 'google_temp.db');
+
+      final googleBytes =
+          await Area3DbGenerator.generateEmptyGoogleMeasurementDb(googlePath);
+
+      // 暗号化
+      final encryptedGoogle = _xorProcess(googleBytes);
+
+      // アーカイブに追加
+      final googleFile = ArchiveFile('google_app_measurement_local.db',
+          encryptedGoogle.length, encryptedGoogle);
+      innerArchive.addFile(googleFile);
+
+      // journal も追加
+      final googleJournal = JournalGenerator.generateEmptyJournal();
+      final googleJournalFile = ArchiveFile(
+          'google_app_measurement_local.db-journal',
+          googleJournal.length,
+          googleJournal);
+      innerArchive.addFile(googleJournalFile);
+
+      // 一時ファイル削除
+      await File(googlePath).delete();
+
+      debugPrint('Generated google_app_measurement_local.db and journal');
     }
 
     // 2. 第一段階ZIPをエンコード

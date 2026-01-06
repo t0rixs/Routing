@@ -20,8 +20,37 @@ class HomeScreen extends StatelessWidget {
               if (vm.isLoading) {
                 return Container(
                   color: Colors.black54,
-                  child: const Center(
-                    child: CircularProgressIndicator(),
+                  child: Center(
+                    child: Card(
+                      margin: const EdgeInsets.symmetric(horizontal: 32),
+                      child: Padding(
+                        padding: const EdgeInsets.all(24.0),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text('Processing Data...',
+                                style: TextStyle(
+                                    fontSize: 18, fontWeight: FontWeight.bold)),
+                            const SizedBox(height: 20),
+                            LinearProgressIndicator(
+                              value: vm.totalFiles > 0
+                                  ? vm.processedFiles / vm.totalFiles
+                                  : null,
+                            ),
+                            const SizedBox(height: 12),
+                            Text(
+                              '${vm.processedFiles} / ${vm.totalFiles} files',
+                              style: const TextStyle(fontSize: 16),
+                            ),
+                            if (vm.progress > 0)
+                              Text(
+                                '${(vm.progress * 100).toStringAsFixed(1)}%',
+                                style: const TextStyle(color: Colors.grey),
+                              ),
+                          ],
+                        ),
+                      ),
+                    ),
                   ),
                 );
               }
