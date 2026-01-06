@@ -28,22 +28,20 @@ class DatabaseRepository {
   /// 特定のキーに対応するデータベースを開く
   Future<Database?> openDB(DBKey key, {bool readOnly = true}) async {
     final dbDir = await _dbDirectoryPath;
-    final path = p.join(dbDir, key.toFileName());
+    String filename = key.toFileName();
+    String path = p.join(dbDir, filename);
 
     // キャッシュチェック
     if (_openDatabases.containsKey(key)) {
       final db = _openDatabases[key]!;
-      final currentMode = _openDbModes[key] ?? true; // デフォルトはreadOnlyと仮定
+      final currentMode = _openDbModes[key] ?? true;
 
       if (db.isOpen) {
-        // 要求がWritable(readOnly=false)なのに、キャッシュがReadOnlyの場合は開き直す
         if (!readOnly && currentMode) {
-          // 閉じて作り直し
           await db.close();
           _openDatabases.remove(key);
           _openDbModes.remove(key);
         } else {
-          // そのまま使える (ReadOnly要求ならWritableでもOK、Writable要求ならWritableのみ)
           return db;
         }
       } else {
@@ -52,9 +50,21 @@ class DatabaseRepository {
       }
     }
 
-    final file = File(path);
-    if (!await file.exists()) {
-      if (readOnly) {
+    // ファイル存在確認 (.db 優先、無ければ .sqlite を探す)
+    final fileDb = File(path);
+    if (!await fileDb.exists()) {
+      // .db が無い場合、.sqlite をチェック
+      // key.toFileName() は通常 .db を返すと仮定
+      if (filename.endsWith('.db')) {
+        final sqliteName = filename.replaceAll(RegExp(r'\.db$'), '.sqlite');
+        final sqlitePath = p.join(dbDir, sqliteName);
+        if (await File(sqlitePath).exists()) {
+          path = sqlitePath; // .sqlite を採用
+        }
+      }
+
+      // それでも無くてReadOnlyなら戻る
+      if (!await File(path).exists() && readOnly) {
         return null;
       }
     }
@@ -63,6 +73,8 @@ class DatabaseRepository {
       final db = await openDatabase(
         path,
         readOnly: readOnly,
+        // WALモードを明示的に有効化またはチェックポイント設定などを考慮しても良いが、
+        // とりあえず単一ファイルへの接続として開く
         version: readOnly ? null : 1,
         onCreate: readOnly
             ? null

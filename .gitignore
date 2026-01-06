@@ -47,3 +47,4 @@ app.*.map.json
 # Local configuration
 local.properties
 android/local.properties
+assets/mapping_data/

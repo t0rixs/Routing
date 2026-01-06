@@ -2,6 +2,8 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
 
 /// ファイル操作 (.mappingファイルのインポート・エクスポート) を担当するリポジトリ
 class FileRepository {
@@ -302,5 +304,189 @@ class FileRepository {
     }
     await finalFile.writeAsBytes(bytes);
     debugPrint('Restored Single DB: $filename');
+  }
+
+  /// 現在のDBデータをエクスポートして .mapping ファイルを作成し、共有する
+  /// [dbBasePath]: データベースディレクトリパス
+  Future<void> exportMappingFile(String dbBasePath) async {
+    debugPrint('Exporting .mapping file from $dbBasePath');
+    final dbDir = Directory(dbBasePath);
+    if (!await dbDir.exists()) {
+      debugPrint('No database directory found.');
+      return;
+    }
+
+    // 1. 第一段階ZIP用のアーカイブ作成 (myalltracks.backup の中身)
+    final innerArchive = Archive();
+    final files = dbDir.listSync(recursive: false);
+    int dbCount = 0;
+
+    for (var entity in files) {
+      if (entity is! File) continue;
+
+      final name = p.basename(entity.path);
+      final lowerName = name.toLowerCase();
+
+      // 対象: .db, .db-journal ファイル
+      bool isTarget = false;
+      if (lowerName.endsWith('.db') ||
+          lowerName.endsWith('.db-journal') ||
+          lowerName.endsWith('.sqlite') ||
+          lowerName.endsWith('.sqlite-journal')) {
+        isTarget = true;
+      }
+
+      if (isTarget) {
+        String exportName = name;
+
+        // hm_ ファイルの場合、Zoom +2 調整
+        final regex = RegExp(
+            r'^hm_(\d+)_(\d+_\d+)(?:\.db|\.sqlite)((?:-journal)?)$',
+            caseSensitive: false);
+        final match = regex.firstMatch(name);
+
+        if (match != null) {
+          try {
+            final int currentZoom = int.parse(match.group(1)!);
+            final String coordsPart = match.group(2)!;
+            final String journalSuffix = match.group(3) ?? '';
+            final int newZoom = currentZoom + 2;
+
+            // 拡張子は .db に統一
+            exportName = 'hm_${newZoom}_${coordsPart}.db$journalSuffix';
+          } catch (e) {
+            debugPrint('Error adjusting zoom for export $name: $e');
+          }
+        } else {
+          // .sqlite を .db に変換
+          if (lowerName.endsWith('.sqlite')) {
+            exportName = p.basenameWithoutExtension(name) + '.db';
+          } else if (lowerName.endsWith('.sqlite-journal')) {
+            exportName =
+                p.basenameWithoutExtension(p.basenameWithoutExtension(name)) +
+                    '.db-journal';
+          }
+        }
+
+        try {
+          final bytes = await entity.readAsBytes();
+
+          List<int> processedBytes;
+          // 本アプリ内の .db ファイルは暗号化されているため、エクスポート時に復号
+          // .sqlite ファイルは平文のためそのまま → .db にリネーム
+          if (lowerName.endsWith('.db') || lowerName.endsWith('.db-journal')) {
+            // 暗号化されているので復号して出力
+            processedBytes = _xorProcess(bytes);
+          } else {
+            // .sqlite 系は平文なのでそのまま
+            processedBytes = bytes;
+          }
+
+          final archiveFile =
+              ArchiveFile(exportName, processedBytes.length, processedBytes);
+          innerArchive.addFile(archiveFile);
+          dbCount++;
+        } catch (e) {
+          debugPrint('Error processing file $name: $e');
+        }
+      }
+    }
+
+    if (dbCount == 0) {
+      debugPrint('No database files found to export.');
+      return;
+    }
+
+    // 1.5. .db-journal ファイルが存在しない .db ファイルに対して空の journal を生成
+    // (iOS → Android 互換性のため)
+    final dbFilesInArchive = <String>{};
+    final journalFilesInArchive = <String>{};
+
+    for (var file in innerArchive.files) {
+      final name = file.name;
+      if (name.endsWith('.db')) {
+        dbFilesInArchive.add(name);
+      } else if (name.endsWith('.db-journal')) {
+        // .db-journal から .db の名前を取得
+        final dbName = name.substring(0, name.length - 8); // "-journal" を除去
+        journalFilesInArchive.add(dbName);
+      }
+    }
+
+    // journal が無い .db ファイルに対して空の journal を追加
+    for (var dbFileName in dbFilesInArchive) {
+      if (!journalFilesInArchive.contains(dbFileName)) {
+        final journalName = '$dbFileName-journal';
+        // 空のジャーナルファイル（512バイト）を作成
+        final emptyJournal = Uint8List(512);
+        final journalFile =
+            ArchiveFile(journalName, emptyJournal.length, emptyJournal);
+        innerArchive.addFile(journalFile);
+        debugPrint('Generated empty journal: $journalName');
+      }
+    }
+
+    // 2. 第一段階ZIPをエンコード
+    final innerZipBytes = ZipEncoder().encode(innerArchive);
+    if (innerZipBytes == null) {
+      throw Exception('Failed to encode inner archive.');
+    }
+
+    // 3. ヘッダー付与して myalltracks.backup を作成
+    const headerStr = "MyAllTracksBackup.v0001:";
+    final headerBytes = headerStr.codeUnits;
+    final backupBytes = Uint8List(headerBytes.length + innerZipBytes.length);
+    backupBytes.setRange(0, headerBytes.length, headerBytes);
+    backupBytes.setRange(headerBytes.length, backupBytes.length, innerZipBytes);
+
+    // 4. 外側のアーカイブ作成 (MyAllTracks/ 構造)
+    final outerArchive = Archive();
+
+    // myalltracks.backup を MyAllTracks/ 配下に追加
+    final backupFile = ArchiveFile(
+        'MyAllTracks/myalltracks.backup', backupBytes.length, backupBytes);
+    outerArchive.addFile(backupFile);
+
+    // 5. imgs フォルダがあれば追加
+    final imgsDir = Directory(p.join(dbBasePath, 'imgs'));
+    if (await imgsDir.exists()) {
+      final imgFiles = imgsDir.listSync(recursive: true);
+      for (var imgEntity in imgFiles) {
+        if (imgEntity is File) {
+          try {
+            final bytes = await imgEntity.readAsBytes();
+            final relativePath = p.relative(imgEntity.path, from: dbBasePath);
+            final archivePath = 'MyAllTracks/$relativePath';
+            final imgFile = ArchiveFile(archivePath, bytes.length, bytes);
+            outerArchive.addFile(imgFile);
+          } catch (e) {
+            debugPrint('Error adding image file: $e');
+          }
+        }
+      }
+    }
+
+    // 6. 最終的な .mapping ファイルを作成
+    final mappingBytes = ZipEncoder().encode(outerArchive);
+    if (mappingBytes == null) {
+      throw Exception('Failed to encode outer archive.');
+    }
+
+    // 7. 一時ファイルとして保存
+    final tempDir = await getTemporaryDirectory();
+    final timestamp = DateTime.now().millisecondsSinceEpoch;
+    final exportPath = p.join(tempDir.path, 'export_$timestamp.mapping');
+    final exportFile = File(exportPath);
+    await exportFile.writeAsBytes(mappingBytes);
+
+    debugPrint(
+        'Created export file: $exportPath (${mappingBytes.length} bytes)');
+
+    // 8. エクスポート先を選択可能にする
+    await Share.shareXFiles(
+      [XFile(exportPath)],
+      text: 'Mapping Data Export',
+      subject: 'export_$timestamp.mapping',
+    );
   }
 }

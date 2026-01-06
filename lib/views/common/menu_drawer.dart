@@ -85,12 +85,27 @@ class MenuDrawer extends StatelessWidget {
             leading: const Icon(Icons.file_download),
             title: const Text('Export .mapping'),
             onTap: () async {
-              Navigator.pop(context);
-              // 未実装
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                    content: Text('Export feature not implemented yet')),
-              );
+              Navigator.pop(context); // Close drawer
+
+              final importVm =
+                  Provider.of<ImportExportViewModel>(context, listen: false);
+
+              // エクスポート実行
+              await importVm.exportFile();
+
+              if (!context.mounted) return;
+
+              if (importVm.successMessage != null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(content: Text(importVm.successMessage!)),
+                );
+              } else if (importVm.errorMessage != null) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                      content: Text(importVm.errorMessage!),
+                      backgroundColor: Colors.red),
+                );
+              }
             },
           ),
         ],

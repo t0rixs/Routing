@@ -46,14 +46,26 @@ class ImportExportViewModel extends ChangeNotifier {
   }
 
   /// (未実装) エクスポート処理
+  /// エクスポート処理
   Future<void> exportFile() async {
-    // プレースホルダー
-    _isLoading = true;
-    notifyListeners();
-    await Future.delayed(const Duration(seconds: 1));
-    _isLoading = false;
-    _successMessage = 'Export feature is coming soon!';
-    notifyListeners();
+    _setLoading(true);
+    _clearMessages();
+
+    try {
+      // 全てのDB接続を閉じて、WAL等をマージ・フラッシュさせる
+      await _databaseRepository.closeAll();
+
+      final dbPath = await getDatabasesPath();
+      await _fileRepository.exportMappingFile(dbPath);
+      _successMessage = 'Export successful!';
+      notifyListeners();
+    } catch (e) {
+      _errorMessage = 'Export failed: $e';
+      debugPrint(_errorMessage);
+      notifyListeners();
+    } finally {
+      _setLoading(false);
+    }
   }
 
   void _setLoading(bool value) {
