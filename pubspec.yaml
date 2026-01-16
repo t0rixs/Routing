@@ -38,7 +38,7 @@ flutter:
   uses-material-design: true
   assets:
     - assets/mapstyle.json
-    - assets/UI/
+
 flutter_launcher_icons:
   image_path_android: assets/launcher_icon/android_icon.png
   adaptive_icon_background: "#000000" #iconの背景色

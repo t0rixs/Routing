@@ -466,6 +466,10 @@ class FileRepository {
           final archiveFile =
               ArchiveFile(exportName, processedBytes.length, processedBytes);
           innerArchive.addFile(archiveFile);
+          if (exportName == 'area3.db') {
+            debugPrint(
+                '*** Exporting area3.db. Original Size: ${bytes.length}, Processed Size: ${processedBytes.length}');
+          }
           dbCount++;
         } catch (e) {
           debugPrint('Error processing file $name: $e');
@@ -497,6 +501,7 @@ class FileRepository {
     // 1.6. iOS元データの場合、必須DBファイルが無ければ生成
     // (Android版マッピングアプリとの互換性のため)
     final allDbFiles = dbFilesInArchive.toList();
+    debugPrint('*** DB files in archive: $allDbFiles');
 
     // area3.db が無い場合、生成
     if (Area3DbGenerator.needsArea3Db(allDbFiles)) {

@@ -50,3 +50,10 @@ android/local.properties
 assets/mapping_data/
 prompt_for_decompilation_analysis.md
 .agent/
+
+# Android signing
+*.jks
+*.keystore
+key.properties
+android/key.properties
+ios/Flutter/Config.xcconfig
