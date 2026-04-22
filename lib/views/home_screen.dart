@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
-import 'map/map_widget.dart';
+import 'map/map_widget_adaptive.dart';
 import 'common/menu_drawer.dart';
 import '../../viewmodels/import_export_view_model.dart';
 
@@ -13,7 +13,7 @@ class HomeScreen extends StatelessWidget {
       drawer: const MenuDrawer(),
       body: Stack(
         children: [
-          const MapWidget(),
+          const MapWidgetAdaptive(),
           // ローディングインジケータ
           Consumer<ImportExportViewModel>(
             builder: (context, vm, child) {

@@ -2,10 +2,15 @@ import 'dart:async';
 import 'dart:math';
 import 'dart:ui' as ui;
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import '../models/cell.dart';
 import '../repositories/database_repository.dart';
+import '../services/png_encoder_pool.dart';
+import '../utils/cell_index.dart';
 
 /// マップの表示状態とデータロードを管理するViewModel
 class MapViewModel extends ChangeNotifier {
@@ -22,6 +27,86 @@ class MapViewModel extends ChangeNotifier {
 
   // タイル更新用カウンタ to force refresh
   int _tileOverlayCounter = 0;
+  int get tileRefreshCounter => _tileOverlayCounter;
+
+  // --- 位置に基づくセル記録 ---
+  StreamSubscription<Position>? _positionSub;
+  LatLng? _lastRecordedLatLng;
+
+  /// 直近の受信 GPS 座標（follow モードでカメラを追従させるため保持）。
+  LatLng? _lastKnownPosition;
+  LatLng? get lastKnownPosition => _lastKnownPosition;
+
+  /// Follow モード（地図中心を現在地に追従）有効フラグ。
+  bool _followUser = false;
+  bool get followUser => _followUser;
+
+  /// follow 中にカメラを移動すべきタイミングを通知するためのカウンタ。
+  /// Widget 側で値の変化を検知して `animateCamera` を呼ぶ。
+  int _followTick = 0;
+  int get followTick => _followTick;
+
+  /// follow モードを切り替える。ON 時に現在地が既知ならば即座に追従する。
+  void toggleFollowUser() {
+    _followUser = !_followUser;
+    if (_followUser && _lastKnownPosition != null) {
+      _followTick++;
+    }
+    notifyListeners();
+  }
+
+  /// ユーザーが地図を手動操作した場合に follow を解除する（UX 的に自然）。
+  void disableFollowUser() {
+    if (!_followUser) return;
+    _followUser = false;
+    notifyListeners();
+  }
+
+  /// DB に記録済みだが TileOverlay にはまだ反映していない新規セル数。
+  /// 一定数に達するか、ズームレベル変更時にまとめて TileOverlay を再生成する
+  /// （明滅抑止 + 既存セルの val/色/サイズを正しく反映させる）。
+  int _pendingRecordedCount = 0;
+  static const int _pendingFlushThreshold = 5;
+
+  /// 直近に観測した地図ズーム（整数レベル）。ズーム階調が変わったタイミングで
+  /// pending をフラッシュしてタイルキャッシュを破棄する。
+  int? _lastObservedZoomLevel;
+
+  /// 最後にプリフェッチ要求した `(cellZ, shard range)`。
+  /// 同一ビューポートでの重複プリフェッチを抑止する。
+  int? _lastPrefetchCellZ;
+  int? _lastPrefetchDbLatStart;
+  int? _lastPrefetchDbLatEnd;
+  int? _lastPrefetchDbLngStart;
+  int? _lastPrefetchDbLngEnd;
+
+  // --- Manual Cell Size Mode ---
+  bool _isManualCellSize = false;
+  int _manualCellZ = 14;
+  bool get isManualCellSize => _isManualCellSize;
+  int get manualCellZ => _manualCellZ;
+
+  void setManualCellSize(int cellZ) {
+    _isManualCellSize = true;
+    _manualCellZ = cellZ.clamp(3, 14);
+    refreshMap();
+    notifyListeners();
+  }
+
+  void setAutoCellSize() {
+    _isManualCellSize = false;
+    refreshMap();
+    notifyListeners();
+  }
+
+  /// 手動モードで、指定された地図ズームに対する自然な cellZ よりも
+  /// 細かいセル（= 手動 cellZ の方が大きい）を描画しているかどうか。
+  /// true のときはセル境界の黒線を描かずに視認性を確保する。
+  bool shouldHideCellStroke(int mapZoom) {
+    if (!_isManualCellSize) return false;
+    final int autoCellZ = mapZoom.clamp(3, 14);
+    return _manualCellZ > autoCellZ;
+  }
 
   // --- Delete Section Mode State ---
   bool isDeleteSectionMode = false;
@@ -34,16 +119,201 @@ class MapViewModel extends ChangeNotifier {
 
   void onMapCreated(GoogleMapController controller) {
     _refreshTileOverlay();
+    unawaited(startLocationRecording());
+  }
+
+  /// ストリーム用（タイムアウトなし）。
+  /// Android は foreground service を起動してバックグラウンドでも位置を受信する。
+  /// iOS は後続対応予定（現状はフォアグラウンドのみ）。
+  LocationSettings _streamLocationSettings() {
+    switch (defaultTargetPlatform) {
+      case TargetPlatform.android:
+        return AndroidSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 0,
+          intervalDuration: const Duration(seconds: 1),
+          foregroundNotificationConfig: const ForegroundNotificationConfig(
+            notificationTitle: 'Routing',
+            notificationText: '移動履歴を記録中...',
+            enableWakeLock: true,
+            notificationIcon: AndroidResource(
+              name: 'ic_launcher',
+              defType: 'mipmap',
+            ),
+          ),
+        );
+      case TargetPlatform.iOS:
+        return AppleSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 0,
+          pauseLocationUpdatesAutomatically: false,
+          allowBackgroundLocationUpdates: false,
+          activityType: ActivityType.other,
+        );
+      default:
+        return const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          distanceFilter: 0,
+        );
+    }
+  }
+
+  /// 位置ストリームを開始し、移動ごとにセルを記録する。
+  /// Android / iOS のみで動作し、それ以外のプラットフォームでは no-op。
+  Future<void> startLocationRecording() async {
+    if (_positionSub != null) return;
+    if (!(defaultTargetPlatform == TargetPlatform.android ||
+        defaultTargetPlatform == TargetPlatform.iOS)) {
+      return;
+    }
+
+    var permission = await Geolocator.checkPermission();
+
+    if (permission == LocationPermission.unableToDetermine) {
+      return;
+    }
+
+    if (permission == LocationPermission.denied) {
+      permission = await Geolocator.requestPermission();
+    }
+
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      return;
+    }
+
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
+      return;
+    }
+
+    final settings = _streamLocationSettings();
+
+    _positionSub = Geolocator.getPositionStream(
+      locationSettings: settings,
+    ).listen(
+      _onPositionUpdate,
+      onError: (_, __) {},
+      cancelOnError: false,
+    );
+  }
+
+  void _onPositionUpdate(Position position) {
+    final current = LatLng(position.latitude, position.longitude);
+    final previous = _lastRecordedLatLng;
+    _lastRecordedLatLng = current;
+    _lastKnownPosition = current;
+    if (previous != null) {
+      unawaited(_recordCellsForMovement(previous, current));
+    }
+    if (_followUser) {
+      _followTick++;
+      notifyListeners();
+    }
+  }
+
+  /// 前回位置から現在位置までを結ぶ線分が貫通する Zoom14 セル（DDA 判定）を
+  /// 重複なく DB に書き込む。DB 記録は毎回即座に完了させるため、ズーム変更などの
+  /// タイミングで TileOverlay を作り直せば常に最新状態が反映される。
+  /// 描画自体は pending カウンタがしきい値に達したときのみ
+  /// [_refreshTileOverlay] を呼び出す（明滅抑止 / 既存 cell val を正しく反映）。
+  Future<void> _recordCellsForMovement(LatLng from, LatLng to) async {
+    final cells = CellIndex.cellsOnSegment(from, to);
+    if (cells.isEmpty) return;
+    await _databaseRepository.recordVisitedCells14(cells);
+    _pendingRecordedCount += cells.length;
+    if (_pendingRecordedCount >= _pendingFlushThreshold) {
+      _flushPendingRecordings();
+    }
+  }
+
+  /// pending を 0 に戻してタイルを再生成する。
+  void _flushPendingRecordings() {
+    if (_pendingRecordedCount == 0) return;
+    _pendingRecordedCount = 0;
+    _refreshTileOverlay();
+  }
+
+  /// 位置ストリームを停止する（ウィジェット破棄時など）。
+  void disposeLocationRecording() {
+    _positionSub?.cancel();
+    _positionSub = null;
+    _lastRecordedLatLng = null;
   }
 
   void onCameraMove(CameraPosition position) {
     _cameraPosition = position;
   }
 
-  /// タイルオーバーレイを更新 (再描画)
+  /// カメラ操作が落ち着いたタイミングのフック。
+  /// 拡大率（整数ズームレベル）が変わっていて、未反映の新規 cell が残っていれば
+  /// 即座に TileOverlay を再生成してタイルキャッシュを破棄する
+  /// （古いズームで描画された古い絵を掴み続けるのを防ぐ）。
+  void onCameraIdle() {
+    final int currentZoom = _cameraPosition.zoom.floor();
+    final int? prev = _lastObservedZoomLevel;
+    _lastObservedZoomLevel = currentZoom;
+    if (prev != null && prev != currentZoom && _pendingRecordedCount > 0) {
+      _flushPendingRecordings();
+    }
+  }
+
+  /// ビューポートに対応する shard をまとめて DB から取り出し、
+  /// `DatabaseRepository._shardCellCache` に載せる。
+  /// `map_widget` 側で `GoogleMapController.getVisibleRegion()` の結果を渡す想定。
+  ///
+  /// `getTile` → `_queryShardCells` はキャッシュヒット時 in-memory filter で済むので、
+  /// ズーム変更直後の初回タイル生成 DB 待ちを大幅に削減できる。
+  void requestViewportPrefetch(LatLngBounds bounds) {
+    final int mapZoom = _cameraPosition.zoom.floor();
+    final int cellZ = _isManualCellSize ? _manualCellZ : mapZoom.clamp(3, 14);
+    final double cellSize = (0.0002 * pow(2, 14 - cellZ)).toDouble();
+
+    double eastLon = bounds.northeast.longitude;
+    if (eastLon <= -180.0 + 1e-12) eastLon = 180.0;
+    final double eastForIndex = eastLon - 1e-9;
+    final double northForIndex = bounds.northeast.latitude - 1e-9;
+
+    final int sLat = ((bounds.southwest.latitude + 90) / cellSize).floor();
+    final int nLat = ((northForIndex + 90) / cellSize).floor();
+    final int wLng = ((bounds.southwest.longitude + 180) / cellSize).floor();
+    final int eLng = ((eastForIndex + 180) / cellSize).floor();
+
+    final int dbLatStart = sLat ~/ 1000;
+    final int dbLatEnd = nLat ~/ 1000;
+    final int dbLngStart = wLng ~/ 1000;
+    final int dbLngEnd = eLng ~/ 1000;
+
+    if (_lastPrefetchCellZ == cellZ &&
+        _lastPrefetchDbLatStart == dbLatStart &&
+        _lastPrefetchDbLatEnd == dbLatEnd &&
+        _lastPrefetchDbLngStart == dbLngStart &&
+        _lastPrefetchDbLngEnd == dbLngEnd) {
+      return;
+    }
+    _lastPrefetchCellZ = cellZ;
+    _lastPrefetchDbLatStart = dbLatStart;
+    _lastPrefetchDbLatEnd = dbLatEnd;
+    _lastPrefetchDbLngStart = dbLngStart;
+    _lastPrefetchDbLngEnd = dbLngEnd;
+
+    unawaited(_databaseRepository.prefetchShards(
+      cellZ: cellZ,
+      sLat: sLat,
+      nLat: nLat,
+      wLng: wLng,
+      eLng: eLng,
+    ));
+  }
+
+  /// タイルオーバーレイを更新 (再描画)。
+  /// 新しい TileOverlayId に切り替わることで既存タイルキャッシュが破棄される。
   void _refreshTileOverlay() {
     if (_tileOverlayCounter > 1000) _tileOverlayCounter = 0;
     _tileOverlayCounter++;
+
+    // 明示的なフル再描画タイミングでは pending もクリアして整合を取る。
+    _pendingRecordedCount = 0;
 
     _tileOverlay = TileOverlay(
       tileOverlayId: TileOverlayId('heatmap_overlay_$_tileOverlayCounter'),
@@ -196,27 +466,51 @@ class MapViewModel extends ChangeNotifier {
 
   /// タイルの画像データを生成して返すメソッド
   Future<Tile> getTile(int tileX, int tileY, int? zoomDesc) async {
+    // 画質維持のため 512 固定。PNG エンコードは後段の isolate pool で
+    // level 0 並列化することで短縮する。
     const int ts = 512;
-    // debugPrint('getTile Spark: $tileX, $tileY, $zoomDesc');
-
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder);
 
     if (zoomDesc == null) {
-      return _finishTile(recorder, ts);
+      // 描画不要: null data で空タイル扱い（PNG 生成スキップ）。
+      return const Tile(512, 512, null);
     }
 
-    // Zoomレベルの決定: 3..14 にクランプ
+    // Zoomレベルの決定: 3..14 にクランプ（手動モード時は固定値）
     final int tileZ = zoomDesc;
-    final int cellZ = tileZ.clamp(3, 14);
+    final int cellZ = _isManualCellSize ? _manualCellZ : tileZ.clamp(3, 14);
 
     // データを取得
     final cells =
         await _databaseRepository.fetchCells(tileZ, cellZ, tileX, tileY);
 
     if (cells.isEmpty) {
-      return _finishTile(recorder, ts);
+      // セル 0 件 → PNG 生成せず null data で透明タイルを返す。
+      // これだけで、データ未到達エリアの描画コストがほぼ 0 になる。
+      return const Tile(512, 512, null);
     }
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+
+    // Paint をループ外で 1 度だけ確保して使い回す（GC 圧力削減）。
+    final Paint paintFill = Paint()..style = PaintingStyle.fill;
+    final Paint paintStroke = Paint()
+      ..color = Colors.black.withValues(alpha: 0.3)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.5;
+    final Paint paintHighlight = Paint()
+      ..color = Colors.red
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 2.0;
+
+    // 手動モードで cellZ が自動より細かい場合、境界線が密集して見づらいので
+    // ストロークを描かない。また、セル密集時（500+）は drawRect × stroke が
+    // PictureRecorder コスト支配要因になるため自動的にスキップする。
+    final bool hideStroke = shouldHideCellStroke(tileZ) || cells.length > 500;
+
+    final double tsD = ts.toDouble();
+    final double tileOriginX = tileX * tsD;
+    final double tileOriginY = tileY * tsD;
 
     Rect cellRectInThisTile(int latIndex, int lngIndex) {
       final LatLngBounds b = _cellToLatLngBounds(cellZ, latIndex, lngIndex);
@@ -225,11 +519,10 @@ class MapViewModel extends ChangeNotifier {
       final Point<double> ne = latLngToWorldPixel(
           b.northeast.latitude, b.northeast.longitude, tileZ, ts);
 
-      // Convert to tile-local pixels (origin at this tile's top-left)
-      final double pxW = sw.x - tileX * ts.toDouble();
-      final double pyS = sw.y - tileY * ts.toDouble();
-      final double pxE = ne.x - tileX * ts.toDouble();
-      final double pyN = ne.y - tileY * ts.toDouble();
+      final double pxW = sw.x - tileOriginX;
+      final double pyS = sw.y - tileOriginY;
+      final double pxE = ne.x - tileOriginX;
+      final double pyN = ne.y - tileOriginY;
 
       final double left = min(pxW, pxE);
       final double top = min(pyN, pyS);
@@ -238,56 +531,117 @@ class MapViewModel extends ChangeNotifier {
       return Rect.fromLTWH(left, top, width, height);
     }
 
-    // 描画処理
+    final Set<String>? highlightSetForZ =
+        isDeleteSectionMode ? _highlightCache[cellZ] : null;
+
     for (final cell in cells) {
       final Rect r = cellRectInThisTile(cell.lat, cell.lng);
-      // Skip fully out-of-tile rects
       if (r.right <= 0 || r.bottom <= 0 || r.left >= ts || r.top >= ts) {
         continue;
       }
 
-      final color = _calculateCellColor(cell.val, cellZ);
-      final paintFill = Paint()
-        ..color = color
-        ..style = PaintingStyle.fill;
+      paintFill.color = _calculateCellColor(cell.val, cellZ);
       canvas.drawRect(r, paintFill);
 
-      // ストローク (枠線)
-      final paintStroke = Paint()
-        ..color = Colors.black.withValues(alpha: 0.3) // 色を変更 (例: 黒の半透明)
+      if (!hideStroke) {
+        canvas.drawRect(r, paintStroke);
+      }
+
+      if (highlightSetForZ != null &&
+          highlightSetForZ.contains('${cell.lat}_${cell.lng}')) {
+        canvas.drawRect(r, paintHighlight);
+      }
+    }
+
+    // 以下で PNG を生成する。Flutter 標準の `ui.ImageByteFormat.png` は
+    // メイン isolate で zlib 圧縮まで行うためズーム変更時のボトルネックになる。
+    // そこで rawStraightRgba で raw ピクセルだけ取り出し、圧縮レベル 0 の PNG
+    // エンコードを別 isolate pool で並列実行する。
+    final picture = recorder.endRecording();
+    final image = await picture.toImage(ts, ts);
+    try {
+      final rgbaByteData =
+          await image.toByteData(format: ui.ImageByteFormat.rawStraightRgba);
+      if (rgbaByteData == null) return const Tile(512, 512, null);
+      final rgba = rgbaByteData.buffer.asUint8List();
+      final pngBytes =
+          await PngEncoderPool.instance.encode(rgba, ts, ts);
+      return Tile(ts, ts, pngBytes);
+    } finally {
+      image.dispose();
+    }
+  }
+
+  /// `flutter_map` 向け: タイル画像を直接 `ui.Image` として返す。
+  /// PNG エンコード/デコードのオーバーヘッドを回避する。
+  Future<ui.Image> getTileImage(int tileX, int tileY, int zoomDesc) async {
+    const int ts = 512;
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder);
+
+    final int tileZ = zoomDesc;
+    final int cellZ = _isManualCellSize ? _manualCellZ : tileZ.clamp(3, 14);
+
+    final cells =
+        await _databaseRepository.fetchCells(tileZ, cellZ, tileX, tileY);
+
+    if (cells.isNotEmpty) {
+      final Paint paintFill = Paint()..style = PaintingStyle.fill;
+      final Paint paintStroke = Paint()
+        ..color = Colors.black.withValues(alpha: 0.3)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 0.5;
-      canvas.drawRect(r, paintStroke);
+      final Paint paintHighlight = Paint()
+        ..color = Colors.red
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2.0;
 
-      // ハイライト描画 (区間削除モード用)
-      if (isDeleteSectionMode) {
-        bool shouldHighlight = false;
-        // Check cache
-        if (_highlightCache.containsKey(cellZ)) {
-          final key = '${cell.lat}_${cell.lng}';
-          if (_highlightCache[cellZ]!.contains(key)) {
-            shouldHighlight = true;
-          }
+      final double tsD = ts.toDouble();
+      final double tileOriginX = tileX * tsD;
+      final double tileOriginY = tileY * tsD;
+
+      Rect cellRectInThisTile(int latIndex, int lngIndex) {
+        final LatLngBounds b = _cellToLatLngBounds(cellZ, latIndex, lngIndex);
+        final Point<double> sw = latLngToWorldPixel(
+            b.southwest.latitude, b.southwest.longitude, tileZ, ts);
+        final Point<double> ne = latLngToWorldPixel(
+            b.northeast.latitude, b.northeast.longitude, tileZ, ts);
+
+        final double pxW = sw.x - tileOriginX;
+        final double pyS = sw.y - tileOriginY;
+        final double pxE = ne.x - tileOriginX;
+        final double pyN = ne.y - tileOriginY;
+
+        final double left = min(pxW, pxE);
+        final double top = min(pyN, pyS);
+        final double width = (pxE - pxW).abs();
+        final double height = (pyS - pyN).abs();
+        return Rect.fromLTWH(left, top, width, height);
+      }
+
+      final Set<String>? highlightSetForZ =
+          isDeleteSectionMode ? _highlightCache[cellZ] : null;
+
+      for (final cell in cells) {
+        final Rect r = cellRectInThisTile(cell.lat, cell.lng);
+        if (r.right <= 0 || r.bottom <= 0 || r.left >= ts || r.top >= ts) {
+          continue;
         }
 
-        if (shouldHighlight) {
-          final paintHighlight = Paint()
-            ..color = Colors.red
-            ..style = PaintingStyle.stroke
-            ..strokeWidth = 2.0; // Zoomレベルに応じて太さを調整しても良い
+        paintFill.color = _calculateCellColor(cell.val, cellZ);
+        canvas.drawRect(r, paintFill);
+        canvas.drawRect(r, paintStroke);
+
+        if (highlightSetForZ != null &&
+            highlightSetForZ.contains('${cell.lat}_${cell.lng}')) {
           canvas.drawRect(r, paintHighlight);
         }
       }
     }
 
-    return _finishTile(recorder, ts);
-  }
-
-  Future<Tile> _finishTile(ui.PictureRecorder recorder, int ts) async {
     final picture = recorder.endRecording();
-    final image = await picture.toImage(ts, ts);
-    final byteData = await image.toByteData(format: ui.ImageByteFormat.png);
-    return Tile(ts, ts, byteData!.buffer.asUint8List());
+    return picture.toImage(ts, ts);
   }
 
   /// CellのLat/LngインデックスからLatLngBoundsを計算
@@ -316,7 +670,7 @@ class MapViewModel extends ChangeNotifier {
     final double hue = 255 - (ratio * 255);
     return HSVColor.fromAHSV(1.0, hue, 1.0, 0.8)
         .toColor()
-        .withValues(alpha: 0.6); // 透過度調整
+        .withValues(alpha: 1); // 透過度調整
   }
 
   Future<Cell?> onTap(LatLng latLng) async {
@@ -341,6 +695,91 @@ class MapViewModel extends ChangeNotifier {
     }
 
     return cell;
+  }
+
+  /// 表示範囲内のセルを Polygon 描画用データとして返す（flutter_map 用）
+  ///
+  /// タイル座標は表示中の地図ズーム（[zoom]）を使い、
+  /// cellZ（セルの細かさ）は手動モード時は [_manualCellZ]、そうでなければ
+  /// 自動で地図ズームに合わせる。手動モードでは auto-zoom-down は行わない。
+  Future<List<CellPolygon>> fetchCellPolygons(
+      double south, double north, double west, double east, int zoom) async {
+    final int cellZ = _isManualCellSize ? _manualCellZ : zoom.clamp(3, 14);
+
+    // タイル座標は地図ズームを基準にする（getTile と同じ考え方）
+    final int tileZ = zoom.clamp(3, 19);
+
+    final double tileCount = pow(2.0, tileZ).toDouble();
+    final double worldTileWidth = 360.0 / tileCount;
+
+    int tileXStart = ((west + 180) / worldTileWidth).floor();
+    int tileXEnd = ((east + 180) / worldTileWidth).floor();
+    final double latRadS = south * pi / 180.0;
+    final double latRadN = north * pi / 180.0;
+    final double yTileS =
+        (1 - log(tan(pi / 4 + latRadS / 2)) / pi) / 2 * tileCount;
+    final double yTileN =
+        (1 - log(tan(pi / 4 + latRadN / 2)) / pi) / 2 * tileCount;
+    int tileYStart = yTileN.floor();
+    int tileYEnd = yTileS.floor();
+
+    // タイル数が多すぎる場合は tileZ を下げて範囲を圧縮する（自動モードのみ）。
+    // 手動モードではユーザの意図を尊重し、上限だけ設ける。
+    const int maxTileSide = 8;
+    int tilesWide = tileXEnd - tileXStart + 1;
+    int tilesHigh = tileYEnd - tileYStart + 1;
+    if (tilesWide > maxTileSide) {
+      tileXEnd = tileXStart + maxTileSide - 1;
+    }
+    if (tilesHigh > maxTileSide) {
+      tileYEnd = tileYStart + maxTileSide - 1;
+    }
+
+    // タイル並列フェッチ
+    final futures = <Future<Set<Cell>>>[];
+    for (int tx = tileXStart; tx <= tileXEnd; tx++) {
+      for (int ty = tileYStart; ty <= tileYEnd; ty++) {
+        futures.add(_databaseRepository.fetchCells(tileZ, cellZ, tx, ty));
+      }
+    }
+    final chunks = await Future.wait(futures);
+    final Set<Cell> allCells = {};
+    for (final c in chunks) {
+      allCells.addAll(c);
+    }
+
+    if (allCells.isEmpty) return [];
+
+    // CellPolygon に変換
+    final double cs = (0.0002 * pow(2, 14 - cellZ)).toDouble();
+    final List<CellPolygon> result = [];
+    for (final cell in allCells) {
+      final double cellSouth = cell.lat * cs - 90.0;
+      final double cellNorth = cellSouth + cs;
+      final double cellWest = cell.lng * cs - 180.0;
+      final double cellEast = cellWest + cs;
+      if (cellNorth < south ||
+          cellSouth > north ||
+          cellEast < west ||
+          cellWest > east) {
+        continue;
+      }
+
+      final color = _calculateCellColor(cell.val, cellZ);
+      final isHighlighted = isDeleteSectionMode &&
+          _highlightCache.containsKey(cellZ) &&
+          _highlightCache[cellZ]!.contains('${cell.lat}_${cell.lng}');
+
+      result.add(CellPolygon(
+        south: cellSouth,
+        north: cellNorth,
+        west: cellWest,
+        east: cellEast,
+        color: color,
+        isHighlighted: isHighlighted,
+      ));
+    }
+    return result;
   }
 }
 

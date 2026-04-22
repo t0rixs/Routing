@@ -3,9 +3,49 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:provider/provider.dart';
 import '../../viewmodels/map_view_model.dart';
 import 'package:intl/intl.dart';
+import 'cell_size_control.dart';
 
-class MapWidget extends StatelessWidget {
+class MapWidget extends StatefulWidget {
   const MapWidget({super.key});
+
+  @override
+  State<MapWidget> createState() => _MapWidgetState();
+}
+
+class _MapWidgetState extends State<MapWidget> {
+  MapViewModel? _mapViewModel;
+  GoogleMapController? _controller;
+  int _lastFollowTick = 0;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_mapViewModel == null) {
+      _mapViewModel = context.read<MapViewModel>();
+      _lastFollowTick = _mapViewModel!.followTick;
+      _mapViewModel!.addListener(_onViewModelChanged);
+    }
+  }
+
+  @override
+  void dispose() {
+    _mapViewModel?.removeListener(_onViewModelChanged);
+    _mapViewModel?.disposeLocationRecording();
+    super.dispose();
+  }
+
+  /// follow モード中に現在地が更新された場合、カメラを追従させる。
+  void _onViewModelChanged() {
+    final vm = _mapViewModel;
+    if (vm == null) return;
+    if (vm.followTick != _lastFollowTick) {
+      _lastFollowTick = vm.followTick;
+      final pos = vm.lastKnownPosition;
+      if (vm.followUser && pos != null && _controller != null) {
+        _controller!.animateCamera(CameraUpdate.newLatLng(pos));
+      }
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -15,8 +55,24 @@ class MapWidget extends StatelessWidget {
           children: [
             GoogleMap(
               initialCameraPosition: viewModel.cameraPosition,
-              onMapCreated: viewModel.onMapCreated,
+              onMapCreated: (controller) {
+                _controller = controller;
+                viewModel.onMapCreated(controller);
+              },
               onCameraMove: viewModel.onCameraMove,
+              onCameraIdle: () async {
+                viewModel.onCameraIdle();
+                // ビューポート範囲を取得して shard プリフェッチを起動する。
+                // 続けて要求される getTile が DB に行かずキャッシュヒットするため、
+                // ズーム変更直後の描画時間を大きく短縮できる。
+                try {
+                  final controller = _controller;
+                  if (controller != null) {
+                    final bounds = await controller.getVisibleRegion();
+                    viewModel.requestViewportPrefetch(bounds);
+                  }
+                } catch (_) {}
+              },
               onTap: (latLng) async {
                 // タップしたセルの情報を取得
                 final cell = await viewModel.onTap(latLng);
@@ -63,7 +119,7 @@ class MapWidget extends StatelessWidget {
               tileOverlays:
                   viewModel.tileOverlay != null ? {viewModel.tileOverlay!} : {},
               myLocationEnabled: true,
-              myLocationButtonEnabled: false,
+              myLocationButtonEnabled: true,
               zoomControlsEnabled: false,
               compassEnabled: true,
               mapToolbarEnabled: false,
@@ -140,6 +196,37 @@ class MapWidget extends StatelessWidget {
                   ),
                 ),
               ),
+            const Positioned(
+              bottom: 16,
+              left: 16,
+              child: CellSizeControl(),
+            ),
+            Positioned(
+              // Scaffold 側の menu FAB と重ならないように上に積む
+              bottom: 80,
+              right: 16,
+              child: FloatingActionButton(
+                heroTag: 'followUserFab',
+                mini: true,
+                backgroundColor:
+                    viewModel.followUser ? Colors.blue : Colors.white,
+                foregroundColor:
+                    viewModel.followUser ? Colors.white : Colors.blue,
+                tooltip: viewModel.followUser ? '追従中（タップで解除）' : '現在地に追従',
+                onPressed: () {
+                  viewModel.toggleFollowUser();
+                  final pos = viewModel.lastKnownPosition;
+                  if (viewModel.followUser && pos != null) {
+                    _controller?.animateCamera(CameraUpdate.newLatLng(pos));
+                  }
+                },
+                child: Icon(
+                  viewModel.followUser
+                      ? Icons.gps_fixed
+                      : Icons.gps_not_fixed,
+                ),
+              ),
+            ),
           ],
         );
       },

@@ -1,3 +1,5 @@
+import 'package:flutter/material.dart';
+
 /// マッピングデータの最小単位（セル）を表現するクラス
 class Cell {
   final int lat;
@@ -21,7 +23,6 @@ class Cell {
       lng: data['lng'] as int,
       val: data['val'] as int,
       tm: data['tm'] as int,
-      // p1はnull許容
       p1: data['p1'] as int?,
     );
   }
@@ -50,4 +51,23 @@ class Cell {
 
   @override
   int get hashCode => lat.hashCode ^ lng.hashCode;
+}
+
+/// Polygon 描画用の軽量なセルデータ（flutter_map 向け）
+class CellPolygon {
+  final double south;
+  final double north;
+  final double west;
+  final double east;
+  final Color color;
+  final bool isHighlighted;
+
+  const CellPolygon({
+    required this.south,
+    required this.north,
+    required this.west,
+    required this.east,
+    required this.color,
+    this.isHighlighted = false,
+  });
 }

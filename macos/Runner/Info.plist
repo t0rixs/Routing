@@ -28,5 +28,11 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSLocationUsageDescription</key>
+	<string>Location access required for tracking visited areas</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Location access required for tracking visited areas</string>
+	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
+	<string>Location access required for tracking visited areas</string>
 </dict>
 </plist>

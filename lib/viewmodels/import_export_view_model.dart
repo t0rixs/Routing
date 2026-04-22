@@ -1,5 +1,4 @@
-import 'package:flutter/foundation.dart';
-import 'package:sqflite/sqflite.dart'; // getDatabasesPathのために必要
+import 'package:flutter/widgets.dart';
 import '../repositories/file_repository.dart';
 import '../repositories/database_repository.dart';
 
@@ -31,9 +30,14 @@ class ImportExportViewModel extends ChangeNotifier {
     _setLoading(true);
     _clearMessages();
     _resetProgress();
+    // 重処理に入る前にオーバーレイを必ず 1 フレーム描画させる
+    await WidgetsBinding.instance.endOfFrame;
 
     try {
-      final dbPath = await getDatabasesPath();
+      final dbPath = await appDatabasesPath();
+
+      // 既存の DB 接続を閉じてキャッシュを無効化（古い inode を掴み続けるのを防ぐ）
+      await _databaseRepository.closeAll();
 
       // インポート処理 (FileRepository内で自動リネームが走る)
       await _fileRepository.importMappingFile(filePath, dbPath,
@@ -64,7 +68,7 @@ class ImportExportViewModel extends ChangeNotifier {
       // 全てのDB接続を閉じて、WAL等をマージ・フラッシュさせる
       await _databaseRepository.closeAll();
 
-      final dbPath = await getDatabasesPath();
+      final dbPath = await appDatabasesPath();
       await _fileRepository.exportMappingFile(dbPath,
           onProgress: _updateProgress);
       _successMessage = 'Export successful!';

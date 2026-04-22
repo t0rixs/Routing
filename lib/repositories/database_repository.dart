@@ -2,11 +2,26 @@ import 'dart:io';
 import 'dart:async';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:sqflite/sqflite.dart';
 import 'package:path/path.dart' as p;
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import '../models/cell.dart';
 import '../models/db_key.dart';
+
+/// アプリ共通の DB ディレクトリ。モバイルは `sqflite.getDatabasesPath()`、
+/// macOS / Linux / Windows では `ApplicationSupport/routing/databases` を使う。
+Future<String> appDatabasesPath() async {
+  if (!kIsWeb && (Platform.isMacOS || Platform.isLinux || Platform.isWindows)) {
+    final support = await getApplicationSupportDirectory();
+    final dbDir = Directory(p.join(support.path, 'databases'));
+    if (!await dbDir.exists()) {
+      await dbDir.create(recursive: true);
+    }
+    return dbDir.path;
+  }
+  return await getDatabasesPath();
+}
 
 /// SQLiteデータベースへのアクセスを担当するリポジトリ
 class DatabaseRepository {
@@ -20,9 +35,16 @@ class DatabaseRepository {
   // DBのモードキャッシュ (true=readOnly, false=writable)
   final Map<DBKey, bool> _openDbModes = {};
 
+  /// shard 単位のセルキャッシュ。viewport プリフェッチで埋まり、
+  /// per-tile の `_queryShardCells` が in-memory フィルタで返せるようにする。
+  /// GPS 記録時は該当 shard のみ `remove` することで fine-grained に無効化する。
+  final Map<DBKey, List<Cell>> _shardCellCache = {};
+  // 同一 shard への同時 prefetch 重複起動を防ぐ
+  final Map<DBKey, Future<List<Cell>>> _shardPrefetchInFlight = {};
+
   /// データベースディレクトリのパスを取得
   Future<String> get _dbDirectoryPath async {
-    return await getDatabasesPath();
+    return await appDatabasesPath();
   }
 
   /// 特定のキーに対応するデータベースを開く
@@ -129,22 +151,120 @@ class DatabaseRepository {
 
       // debugPrint('Fetching cells: Tile($tileZ, $x, $y) -> Index($s-$n, $w-$e) -> Shard($dbLatStart-$dbLatEnd, $dbLngStart-$dbLngEnd)');
 
-      // 5. 各DBからデータを取得
+      // 5. 各DBからデータを並列に取得する（sqflite は native 側 I/O スレッドで
+      //    並行実行できるため、シャードごとの逐次 await を並列化するだけで
+      //    チャネル RTT 分の待ちを削減できる）。
+      final futures = <Future<List<Cell>>>[];
       for (int dblat = dbLatStart; dblat <= dbLatEnd; dblat++) {
         for (int dblng = dbLngStart; dblng <= dbLngEnd; dblng++) {
           final dbKey = DBKey(cellZ, dblat, dblng);
-          final db = await openDB(dbKey, readOnly: true);
-
-          if (db != null) {
-            await _loadCellsFromDb(db, cells, s, n, w, e);
-          }
+          futures.add(_queryShardCells(dbKey, s, n, w, e));
         }
+      }
+      final chunks = await Future.wait(futures);
+      for (final chunk in chunks) {
+        cells.addAll(chunk);
       }
     } catch (e) {
       debugPrint('Error in fetchCells: $e');
     }
 
     return cells;
+  }
+
+  /// 単一シャードから境界内のセルを取得する（fetchCells 並列化用のヘルパ）。
+  ///
+  /// `_shardCellCache` にヒットした場合は DB に行かず in-memory filter のみ返す。
+  /// ミス時は従来通り bound 付き SELECT（fallback）を実行するが、
+  /// prefetchShards が完了していない初回や、非常に巨大な shard のセーフティネット。
+  Future<List<Cell>> _queryShardCells(
+      DBKey key, int s, int n, int w, int e) async {
+    final cached = _shardCellCache[key];
+    if (cached != null) {
+      return [
+        for (final c in cached)
+          if (c.lat >= s && c.lat <= n && c.lng >= w && c.lng <= e) c
+      ];
+    }
+    final db = await openDB(key, readOnly: true);
+    if (db == null) return const <Cell>[];
+    try {
+      final List<Map<String, dynamic>> res = await db.query(
+        'heatmap_table',
+        where: 'lat >= ? AND lat <= ? AND lng >= ? AND lng <= ?',
+        whereArgs: [s, n, w, e],
+      );
+      return [for (final row in res) Cell.fromSqlite(row)];
+    } catch (err) {
+      debugPrint('Shard query error $key: $err');
+      return const <Cell>[];
+    }
+  }
+
+  /// viewport 内のセル領域に必要な全シャードを先読みしてメモリキャッシュする。
+  ///
+  /// `cellZ` はセルのズーム（自動モードなら `floor(mapZoom).clamp(3,14)`、
+  /// 手動モードなら `_manualCellZ`）。`[sLat..nLat] × [wLng..eLng]` は
+  /// セルインデックス空間の包含範囲。
+  Future<void> prefetchShards({
+    required int cellZ,
+    required int sLat,
+    required int nLat,
+    required int wLng,
+    required int eLng,
+  }) async {
+    final int dbLatStart = sLat ~/ 1000;
+    final int dbLatEnd = nLat ~/ 1000;
+    final int dbLngStart = wLng ~/ 1000;
+    final int dbLngEnd = eLng ~/ 1000;
+
+    final List<Future<void>> futures = [];
+    for (int dblat = dbLatStart; dblat <= dbLatEnd; dblat++) {
+      for (int dblng = dbLngStart; dblng <= dbLngEnd; dblng++) {
+        final key = DBKey(cellZ, dblat, dblng);
+        if (_shardCellCache.containsKey(key)) continue;
+        futures.add(_prefetchSingleShard(key));
+      }
+    }
+    if (futures.isEmpty) return;
+    await Future.wait(futures);
+  }
+
+  Future<void> _prefetchSingleShard(DBKey key) async {
+    if (_shardCellCache.containsKey(key)) return;
+    final existing = _shardPrefetchInFlight[key];
+    if (existing != null) {
+      await existing;
+      return;
+    }
+    final future = _loadEntireShard(key);
+    _shardPrefetchInFlight[key] = future;
+    try {
+      final cells = await future;
+      _shardCellCache[key] = cells;
+    } finally {
+      _shardPrefetchInFlight.remove(key);
+    }
+  }
+
+  Future<List<Cell>> _loadEntireShard(DBKey key) async {
+    final db = await openDB(key, readOnly: true);
+    if (db == null) return const <Cell>[];
+    try {
+      final List<Map<String, dynamic>> res = await db.query(
+        'heatmap_table',
+        columns: ['lat', 'lng', 'val', 'tm', 'p1'],
+      );
+      return [for (final row in res) Cell.fromSqlite(row)];
+    } catch (err) {
+      debugPrint('Shard prefetch error $key: $err');
+      return const <Cell>[];
+    }
+  }
+
+  void _invalidateShardForCell(int z, int lat, int lng) {
+    final key = DBKey(z, lat ~/ 1000, lng ~/ 1000);
+    _shardCellCache.remove(key);
   }
 
   /// 指定されたインデックスの単一セルを取得
@@ -173,25 +293,6 @@ class DatabaseRepository {
     return null;
   }
 
-  /// DBから範囲内のセルを読み込む
-  Future<void> _loadCellsFromDb(
-      Database db, Set<Cell> cells, int s, int n, int w, int e) async {
-    try {
-      // 範囲検索
-      final List<Map<String, dynamic>> res = await db.query(
-        'heatmap_table',
-        where: 'lat >= ? AND lat <= ? AND lng >= ? AND lng <= ?',
-        whereArgs: [s, n, w, e],
-      );
-
-      for (final row in res) {
-        cells.add(Cell.fromSqlite(row));
-      }
-    } catch (e) {
-      debugPrint('DB query error: $e');
-    }
-  }
-
   /// タイル座標を緯度経度範囲に変換 (Web Mercator)
   LatLngBounds _tileToLatLngBounds(int zoom, int x, int y) {
     double n = pow(2.0, zoom).toDouble();
@@ -217,6 +318,7 @@ class DatabaseRepository {
   }
 
   /// 起動時に既存のDBファイル一覧をスキャンしてログ出力 (デバッグ用)
+  /// macOS / Linux / Windows では書き込み権限も付与する
   Future<void> scanExistingDatabases() async {
     final dbPath = await _dbDirectoryPath;
     final dir = Directory(dbPath);
@@ -227,6 +329,12 @@ class DatabaseRepository {
     for (var f in files) {
       if (f is File && (f.path.endsWith('.db') || f.path.endsWith('.sqlite'))) {
         debugPrint('Found DB: ${p.basename(f.path)} Size: ${await f.length()}');
+        // macOS sandbox 環境でファイルが読み取り専用になるのを防止
+        if (!kIsWeb && (Platform.isMacOS || Platform.isLinux)) {
+          try {
+            await Process.run('chmod', ['644', f.path]);
+          } catch (_) {}
+        }
       }
     }
     debugPrint('--- Scan Complete ---');
@@ -238,6 +346,9 @@ class DatabaseRepository {
       await db.close();
     }
     _openDatabases.clear();
+    _openDbModes.clear();
+    _shardCellCache.clear();
+    _shardPrefetchInFlight.clear();
   }
 
   /// 指定された時間範囲に含まれるセルを全DBから検索して取得 (Zoom 14 と仮定)
@@ -344,6 +455,69 @@ class DatabaseRepository {
       await db.update('heatmap_table', {'val': newVal},
           where: 'lat = ? AND lng = ?', whereArgs: [lat, lng]);
     }
+    _invalidateShardForCell(z, lat, lng);
+  }
+
+  /// 移動に伴い通過した Zoom14 セル（重複なし）を記録する。各セルは val を 1 増やし、親ズームも更新する。
+  Future<void> recordVisitedCells14(Set<(int, int)> cellIndices) async {
+    if (cellIndices.isEmpty) return;
+    const int baseZ = 14;
+    for (final (lat, lng) in cellIndices) {
+      await _incrementCellVal(baseZ, lat, lng, 1);
+      for (int z = 3; z < baseZ; z++) {
+        final double divisor = pow(2, baseZ - z).toDouble();
+        final int parentLat = (lat / divisor).floor();
+        final int parentLng = (lng / divisor).floor();
+        await _incrementCellVal(z, parentLat, parentLng, 1);
+      }
+    }
+  }
+
+  Future<void> _incrementCellVal(int z, int lat, int lng, int delta) async {
+    final dbLat = lat ~/ 1000;
+    final dbLng = lng ~/ 1000;
+    final key = DBKey(z, dbLat, dbLng);
+    final db = await openDB(key, readOnly: false);
+    if (db == null) return;
+
+    final int now = DateTime.now().millisecondsSinceEpoch;
+    try {
+      final List<Map<String, dynamic>> res = await db.query(
+        'heatmap_table',
+        columns: ['val', 'p1'],
+        where: 'lat = ? AND lng = ?',
+        whereArgs: [lat, lng],
+      );
+
+      if (res.isEmpty) {
+        await db.insert('heatmap_table', {
+          'lat': lat,
+          'lng': lng,
+          'val': delta,
+          'tm': now,
+          'p1': now,
+        });
+      } else {
+        final int currentVal = res.first['val'] as int;
+        final int? p1 = res.first['p1'] as int?;
+        final Map<String, dynamic> updateMap = {
+          'val': currentVal + delta,
+          'tm': now,
+        };
+        if (p1 == null || p1 <= 0) {
+          updateMap['p1'] = now;
+        }
+        await db.update(
+          'heatmap_table',
+          updateMap,
+          where: 'lat = ? AND lng = ?',
+          whereArgs: [lat, lng],
+        );
+      }
+    } catch (e) {
+      debugPrint('Error incrementing cell z=$z lat=$lat lng=$lng: $e');
+    }
+    _invalidateShardForCell(z, lat, lng);
   }
 
   /// 指定セルから値を引く
@@ -374,5 +548,6 @@ class DatabaseRepository {
     } catch (e) {
       debugPrint('Error decrementing cell: $e');
     }
+    _invalidateShardForCell(z, lat, lng);
   }
 }

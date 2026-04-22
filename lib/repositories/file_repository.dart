@@ -295,6 +295,12 @@ class FileRepository {
             await finalFile.delete();
           }
           await finalFile.writeAsBytes(decryptedBytes);
+          // macOS / Linux sandbox で書き込んだファイルに書き込み権限を確実に付与する
+          if (!kIsWeb && (Platform.isMacOS || Platform.isLinux)) {
+            try {
+              await Process.run('chmod', ['644', finalPath]);
+            } catch (_) {}
+          }
           debugPrint('Restored: ${file.name} -> $saveName');
         } else {
           debugPrint('Skipped non-db file: $filename');
@@ -316,6 +322,11 @@ class FileRepository {
       await finalFile.delete();
     }
     await finalFile.writeAsBytes(bytes);
+    if (!kIsWeb && (Platform.isMacOS || Platform.isLinux)) {
+      try {
+        await Process.run('chmod', ['644', finalPath]);
+      } catch (_) {}
+    }
     debugPrint('Restored Single DB: $filename');
   }
 
