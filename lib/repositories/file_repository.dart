@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:flutter/foundation.dart';
 import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
@@ -24,6 +26,11 @@ class FileRepository {
   }
 
   /// .mappingファイルをインポートする
+  ///
+  /// 重い処理（ZIP 展開・XOR 復号・DB ファイル書き出し）は背景 isolate で実行し、
+  /// メイン isolate をブロックしない。これにより Processing Data オーバーレイの
+  /// CircularProgressIndicator が止まらずに回り続け、UI が応答可能な状態を保つ。
+  ///
   /// [filePath]: 選択されたファイルのパス
   /// [dbBasePath]: アプリのデータベースディレクトリパス
   Future<void> importMappingFile(String filePath, String dbBasePath,
@@ -33,7 +40,7 @@ class FileRepository {
       throw Exception('File not found: $filePath');
     }
 
-    // 0. 既存データの削除 (Clean Install)
+    // 0. 既存データの削除 (Clean Install) — 軽いのでメイン isolate で処理する
     final dbDir = Directory(dbBasePath);
     if (await dbDir.exists()) {
       final files = dbDir.listSync();
@@ -50,30 +57,48 @@ class FileRepository {
       }
     }
 
-    // 1. .mapping (ZIP) を読み込む
-    debugPrint('Opening mapping file: $filePath');
-    final bytes = await file.readAsBytes();
-    final archive = ZipDecoder().decodeBytes(bytes);
-
-    // 2. 中身を展開
-    bool backupFound = false;
-    for (final entity in archive) {
-      debugPrint('Entry in mapping: ${entity.name}');
-      if (entity.isFile) {
-        // ZIP内のパスが含まれていても検知できるように endsWith または basename で判定
-        if (entity.name.endsWith('myalltracks.backup')) {
-          backupFound = true;
-          debugPrint('Found backup file: ${entity.name}. Restoring...');
-          await _restoreBackup(
-              entity.content as List<int>, dbBasePath, onProgress);
-        } else if (p.extension(entity.name) == '.jpg') {
-          // 画像ファイル等の処理
-          // 必要ならば documents/imgs 等へ保存
+    // 1. 重い処理は isolate に投げる。進捗は ReceivePort 経由で受け取る。
+    final recv = ReceivePort();
+    final completer = Completer<void>();
+    final sub = recv.listen((message) {
+      if (message is List && message.isNotEmpty) {
+        switch (message[0]) {
+          case 'progress':
+            if (onProgress != null &&
+                message.length >= 3 &&
+                message[1] is int &&
+                message[2] is int) {
+              onProgress(message[1] as int, message[2] as int);
+            }
+            break;
+          case 'log':
+            if (message.length >= 2) debugPrint(message[1].toString());
+            break;
+          case 'done':
+            if (!completer.isCompleted) completer.complete();
+            break;
+          case 'error':
+            if (!completer.isCompleted) {
+              completer.completeError(
+                  Exception(message.length >= 2 ? message[1] : 'Unknown'));
+            }
+            break;
         }
       }
-    }
-    if (!backupFound) {
-      debugPrint('Warning: myalltracks.backup not found in mapping file.');
+    });
+
+    Isolate? isolate;
+    try {
+      isolate = await Isolate.spawn(
+        _importIsolateEntry,
+        [recv.sendPort, filePath, dbBasePath],
+        errorsAreFatal: true,
+      );
+      await completer.future;
+    } finally {
+      isolate?.kill(priority: Isolate.immediate);
+      await sub.cancel();
+      recv.close();
     }
   }
 
@@ -665,5 +690,45 @@ class FileRepository {
       text: 'Mapping Data Export',
       subject: 'export_$timestamp.mapping',
     );
+  }
+}
+
+/// インポートの CPU 重処理を行う isolate エントリポイント。
+///
+/// メイン isolate からは `Isolate.spawn` で起動され、SendPort 経由で
+/// 進捗とエラーを返す。ライブラリ内トップレベル関数にすることで、
+/// `FileRepository` の `_restoreBackup` / `_restoreSingleDbFile`
+/// （プライベート）を再利用できる。
+void _importIsolateEntry(List<dynamic> args) async {
+  final SendPort sendPort = args[0] as SendPort;
+  final String filePath = args[1] as String;
+  final String dbBasePath = args[2] as String;
+  try {
+    final bytes = await File(filePath).readAsBytes();
+    sendPort.send(['log', 'Isolate: decoded ${bytes.length} bytes']);
+    final archive = ZipDecoder().decodeBytes(bytes);
+
+    final repo = FileRepository();
+    bool backupFound = false;
+    for (final entity in archive) {
+      if (entity.isFile && entity.name.endsWith('myalltracks.backup')) {
+        backupFound = true;
+        await repo._restoreBackup(
+          entity.content as List<int>,
+          dbBasePath,
+          (processed, total) =>
+              sendPort.send(['progress', processed, total]),
+        );
+      }
+    }
+    if (!backupFound) {
+      sendPort.send([
+        'log',
+        'Warning: myalltracks.backup not found in mapping file.'
+      ]);
+    }
+    sendPort.send(['done']);
+  } catch (e, st) {
+    sendPort.send(['error', '$e\n$st']);
   }
 }

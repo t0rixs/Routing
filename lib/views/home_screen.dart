@@ -18,6 +18,10 @@ class HomeScreen extends StatelessWidget {
           Consumer<ImportExportViewModel>(
             builder: (context, vm, child) {
               if (vm.isLoading) {
+                // ファイル展開フェーズ（totalFiles == 0）は進捗率が未確定なので
+                // CircularProgressIndicator（無限スピナー）を表示する。
+                // 展開後の書き出しフェーズに入り次第 LinearProgressIndicator に切替。
+                final bool indeterminate = vm.totalFiles == 0;
                 return Container(
                   color: Colors.black54,
                   child: Center(
@@ -32,21 +36,32 @@ class HomeScreen extends StatelessWidget {
                                 style: TextStyle(
                                     fontSize: 18, fontWeight: FontWeight.bold)),
                             const SizedBox(height: 20),
-                            LinearProgressIndicator(
-                              value: vm.totalFiles > 0
-                                  ? vm.processedFiles / vm.totalFiles
-                                  : null,
-                            ),
-                            const SizedBox(height: 12),
-                            Text(
-                              '${vm.processedFiles} / ${vm.totalFiles} files',
-                              style: const TextStyle(fontSize: 16),
-                            ),
-                            if (vm.progress > 0)
-                              Text(
-                                '${(vm.progress * 100).toStringAsFixed(1)}%',
-                                style: const TextStyle(color: Colors.grey),
+                            if (indeterminate) ...[
+                              const SizedBox(
+                                width: 48,
+                                height: 48,
+                                child: CircularProgressIndicator(),
                               ),
+                              const SizedBox(height: 16),
+                              const Text(
+                                'ファイルを展開中...',
+                                style: TextStyle(fontSize: 14),
+                              ),
+                            ] else ...[
+                              LinearProgressIndicator(
+                                value: vm.processedFiles / vm.totalFiles,
+                              ),
+                              const SizedBox(height: 12),
+                              Text(
+                                '${vm.processedFiles} / ${vm.totalFiles} files',
+                                style: const TextStyle(fontSize: 16),
+                              ),
+                              if (vm.progress > 0)
+                                Text(
+                                  '${(vm.progress * 100).toStringAsFixed(1)}%',
+                                  style: const TextStyle(color: Colors.grey),
+                                ),
+                            ],
                           ],
                         ),
                       ),

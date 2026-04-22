@@ -351,6 +351,30 @@ class DatabaseRepository {
     _shardPrefetchInFlight.clear();
   }
 
+  /// 記録済みデータを全て削除する。
+  /// 呼び出し元は事前に描画と位置記録を停止しておくこと（MapViewModel.setBusy(true)）。
+  Future<void> clearAllData() async {
+    await closeAll();
+    final dbPath = await _dbDirectoryPath;
+    final dir = Directory(dbPath);
+    if (!await dir.exists()) return;
+    final files = dir.listSync();
+    for (final f in files) {
+      if (f is File &&
+          (f.path.endsWith('.db') ||
+              f.path.endsWith('.sqlite') ||
+              f.path.endsWith('.db-journal') ||
+              f.path.endsWith('.sqlite-journal'))) {
+        try {
+          await f.delete();
+          debugPrint('Cleared: ${p.basename(f.path)}');
+        } catch (e) {
+          debugPrint('Failed to clear ${p.basename(f.path)}: $e');
+        }
+      }
+    }
+  }
+
   /// 指定された時間範囲に含まれるセルを全DBから検索して取得 (Zoom 14 と仮定)
   Future<List<Cell>> fetchCellsByTimeRange(int startTime, int endTime) async {
     List<Cell> results = [];

@@ -1,5 +1,7 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:math';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 
 import 'package:flutter/foundation.dart'
@@ -9,7 +11,7 @@ import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import '../models/cell.dart';
 import '../repositories/database_repository.dart';
-import '../services/png_encoder_pool.dart';
+import '../services/tile_rasterizer_pool.dart';
 import '../utils/cell_index.dart';
 
 /// マップの表示状態とデータロードを管理するViewModel
@@ -32,6 +34,32 @@ class MapViewModel extends ChangeNotifier {
   // --- 位置に基づくセル記録 ---
   StreamSubscription<Position>? _positionSub;
   LatLng? _lastRecordedLatLng;
+
+  /// インポート等、DB を一時的に触れない期間のフラグ。true の間:
+  /// - GPS 位置ストリームを完全にキャンセルし、書き込みを一切行わない
+  /// - TileOverlay 再生成や描画要求を全て no-op 化する
+  /// - getTile / getTileImage / fetchCellPolygons は即座に空タイルを返す
+  /// これにより、`closeAll()` 後にファイルが移動／削除されている最中でも
+  /// SQLITE_READONLY_DBMOVED などのエラーがメインスレッドに流入せず、
+  /// 「Processing Data」オーバーレイが即座にレンダリングされる。
+  bool _isBusy = false;
+  bool get isBusy => _isBusy;
+
+  /// タイル解像度（1 辺の px 数）。320/480/512 の 3 段階をユーザが切り替える。
+  /// 変更すると TileOverlay を作り直して再レンダリングを走らせる。
+  int _tileResolution = 480;
+  int get tileResolution => _tileResolution;
+
+  /// 許可される解像度値。UI の選択肢と一致させる。
+  static const List<int> tileResolutionOptions = <int>[320, 480, 512];
+
+  void setTileResolution(int ts) {
+    if (!tileResolutionOptions.contains(ts)) return;
+    if (_tileResolution == ts) return;
+    _tileResolution = ts;
+    _refreshTileOverlay();
+    notifyListeners();
+  }
 
   /// 直近の受信 GPS 座標（follow モードでカメラを追従させるため保持）。
   LatLng? _lastKnownPosition;
@@ -62,11 +90,59 @@ class MapViewModel extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// インポートなど重処理の前後で呼ぶ。`true` の間は GPS 記録と描画を全停止する。
+  /// 完了時に `false` を渡すと GPS の再購読と TileOverlay の再生成が行われる。
+  Future<void> setBusy(bool busy) async {
+    if (_isBusy == busy) return;
+    _isBusy = busy;
+    if (busy) {
+      // 先に GPS を切ることで、close 済みの DB に対する書き込みが発生しなくなる。
+      await _positionSub?.cancel();
+      _positionSub = null;
+      _lastRecordedLatLng = null;
+      _pendingRecordedCount = 0;
+      // 既存の TileOverlay も無効化して、走り中のタイル生成リクエストを破棄する。
+      _tileOverlay = null;
+      notifyListeners();
+    } else {
+      // 描画を作り直してから位置記録を再開する。
+      _refreshTileOverlay();
+      notifyListeners();
+      unawaited(startLocationRecording());
+    }
+  }
+
   /// DB に記録済みだが TileOverlay にはまだ反映していない新規セル数。
   /// 一定数に達するか、ズームレベル変更時にまとめて TileOverlay を再生成する
   /// （明滅抑止 + 既存セルの val/色/サイズを正しく反映させる）。
   int _pendingRecordedCount = 0;
   static const int _pendingFlushThreshold = 5;
+
+  /// ユーザが地図をドラッグ/ピンチ中かどうか。`onCameraMoveStarted` で true,
+  /// `onCameraIdle` で false に戻す。true の間は `_refreshTileOverlay` を
+  /// 「延期扱い」にして、Google Maps にタイルキャッシュ破棄を発火させない。
+  /// ——これが旧アプリ比でジェスチャがカクつく主因だった。
+  /// 新 TileOverlayId が届くと GM ネイティブ層が全タイル再取得に入るため、
+  /// その間ネイティブコンポジタが忙しくなり指追従が遅れていた。
+  bool _isGesturing = false;
+  bool _deferredRefresh = false;
+
+  /// 可視ビューポート。`onCameraIdle` のタイミングで Map Widget 側から
+  /// 注入される。GPS が画面外の cell を記録しても描画を更新しないように
+  /// するための判定に使う。
+  LatLngBounds? _currentVisibleBounds;
+
+  /// 出力済みタイル PNG の LRU キャッシュ。
+  /// Key: `"ts-tileZ-cellZ-tileX-tileY-hideStroke-delete"` 形式。
+  /// Value: (cell 配列の content hash, PNG バイト列)。
+  /// GM が overlay refresh 後に `getTile` を呼んだ時、
+  /// セル内容が変わっていない (= 前回と hash が一致) なら
+  /// 再ラスタライズせず即座にキャッシュ PNG を返す。
+  /// shard の content が変わると fetchCells の結果が変わり、
+  /// 自動的に hash ミスして再生成されるので無効化の手間はない。
+  final LinkedHashMap<String, _TilePngEntry> _tilePngCache =
+      LinkedHashMap<String, _TilePngEntry>();
+  static const int _tilePngCacheCap = 256;
 
   /// 直近に観測した地図ズーム（整数レベル）。ズーム階調が変わったタイミングで
   /// pending をフラッシュしてタイルキャッシュを破棄する。
@@ -162,6 +238,7 @@ class MapViewModel extends ChangeNotifier {
   /// Android / iOS のみで動作し、それ以外のプラットフォームでは no-op。
   Future<void> startLocationRecording() async {
     if (_positionSub != null) return;
+    if (_isBusy) return;
     if (!(defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS)) {
       return;
@@ -199,6 +276,7 @@ class MapViewModel extends ChangeNotifier {
   }
 
   void _onPositionUpdate(Position position) {
+    if (_isBusy) return;
     final current = LatLng(position.latitude, position.longitude);
     final previous = _lastRecordedLatLng;
     _lastRecordedLatLng = current;
@@ -215,16 +293,49 @@ class MapViewModel extends ChangeNotifier {
   /// 前回位置から現在位置までを結ぶ線分が貫通する Zoom14 セル（DDA 判定）を
   /// 重複なく DB に書き込む。DB 記録は毎回即座に完了させるため、ズーム変更などの
   /// タイミングで TileOverlay を作り直せば常に最新状態が反映される。
-  /// 描画自体は pending カウンタがしきい値に達したときのみ
-  /// [_refreshTileOverlay] を呼び出す（明滅抑止 / 既存 cell val を正しく反映）。
+  ///
+  /// 描画更新は「記録された cell の少なくとも 1 つが画面内に存在する」場合だけ
+  /// pending カウンタに加算する。画面外の cell だけを記録しても TileOverlay は
+  /// 触らない（GM のタイル再取得を発火させないため）。
+  /// 画面外記録分は shard キャッシュ無効化だけで十分 — 後でユーザがその領域に
+  /// パンした際、`requestViewportPrefetch` が最新データを再ロードする。
   Future<void> _recordCellsForMovement(LatLng from, LatLng to) async {
     final cells = CellIndex.cellsOnSegment(from, to);
     if (cells.isEmpty) return;
     await _databaseRepository.recordVisitedCells14(cells);
+
+    if (!_anyCellInVisibleBounds(cells)) {
+      // 画面外の記録 → 描画トリガは発行しない。
+      return;
+    }
+
     _pendingRecordedCount += cells.length;
     if (_pendingRecordedCount >= _pendingFlushThreshold) {
       _flushPendingRecordings();
     }
+  }
+
+  /// 記録された cell (z=14) のいずれかが現在の可視ビューポートに入っているか。
+  /// `_currentVisibleBounds` 未設定時は安全側で true (= 更新を通す) を返す。
+  bool _anyCellInVisibleBounds(Iterable<(int, int)> cells) {
+    final bounds = _currentVisibleBounds;
+    if (bounds == null) return true;
+    const double cellSize = 0.0002; // z=14 基準
+    final double s = bounds.southwest.latitude;
+    final double n = bounds.northeast.latitude;
+    final double w = bounds.southwest.longitude;
+    final double e = bounds.northeast.longitude;
+    // 本アプリは国内利用想定なので日付変更線跨ぎは無視。シンプル AABB で判定。
+    for (final (lat, lng) in cells) {
+      final double south = lat * cellSize - 90.0;
+      final double west = lng * cellSize - 180.0;
+      final double north = south + cellSize;
+      final double east = west + cellSize;
+      if (north < s || south > n) continue;
+      if (east < w || west > e) continue;
+      return true;
+    }
+    return false;
   }
 
   /// pending を 0 に戻してタイルを再生成する。
@@ -241,20 +352,31 @@ class MapViewModel extends ChangeNotifier {
     _lastRecordedLatLng = null;
   }
 
+  /// ユーザ操作（ドラッグ/ピンチ）で地図が動き始めた瞬間のフック。
+  /// 以降 `onCameraIdle` が呼ばれるまでの間、TileOverlay の作り直しを
+  /// 延期キューに積む（ネイティブ側のタイル再取得でジェスチャを止めない）。
+  void onCameraMoveStarted() {
+    _isGesturing = true;
+  }
+
   void onCameraMove(CameraPosition position) {
     _cameraPosition = position;
   }
 
   /// カメラ操作が落ち着いたタイミングのフック。
-  /// 拡大率（整数ズームレベル）が変わっていて、未反映の新規 cell が残っていれば
-  /// 即座に TileOverlay を再生成してタイルキャッシュを破棄する
-  /// （古いズームで描画された古い絵を掴み続けるのを防ぐ）。
+  /// - 拡大率変化 + pending セルがあれば TileOverlay を更新
+  /// - ジェスチャ中に積まれた延期リフレッシュがあればここで 1 回だけ消化
   void onCameraIdle() {
+    _isGesturing = false;
     final int currentZoom = _cameraPosition.zoom.floor();
     final int? prev = _lastObservedZoomLevel;
     _lastObservedZoomLevel = currentZoom;
-    if (prev != null && prev != currentZoom && _pendingRecordedCount > 0) {
+    final bool zoomChanged = prev != null && prev != currentZoom;
+    if (zoomChanged && _pendingRecordedCount > 0) {
       _flushPendingRecordings();
+    } else if (_deferredRefresh) {
+      _deferredRefresh = false;
+      _refreshTileOverlay();
     }
   }
 
@@ -265,6 +387,9 @@ class MapViewModel extends ChangeNotifier {
   /// `getTile` → `_queryShardCells` はキャッシュヒット時 in-memory filter で済むので、
   /// ズーム変更直後の初回タイル生成 DB 待ちを大幅に削減できる。
   void requestViewportPrefetch(LatLngBounds bounds) {
+    // 可視ビューポートを最新に保つ（`_recordCellsForMovement` の可視判定に使う）。
+    _currentVisibleBounds = bounds;
+
     final int mapZoom = _cameraPosition.zoom.floor();
     final int cellZ = _isManualCellSize ? _manualCellZ : mapZoom.clamp(3, 14);
     final double cellSize = (0.0002 * pow(2, 14 - cellZ)).toDouble();
@@ -308,7 +433,16 @@ class MapViewModel extends ChangeNotifier {
 
   /// タイルオーバーレイを更新 (再描画)。
   /// 新しい TileOverlayId に切り替わることで既存タイルキャッシュが破棄される。
+  ///
+  /// ジェスチャ中にこれを呼ぶと GM ネイティブ層がタイル一斉再取得を始めて
+  /// 指追従がカクつくため、ジェスチャ中は `_deferredRefresh` に退避して
+  /// `onCameraIdle` で 1 回だけ実行する。
   void _refreshTileOverlay() {
+    if (_isBusy) return;
+    if (_isGesturing) {
+      _deferredRefresh = true;
+      return;
+    }
     if (_tileOverlayCounter > 1000) _tileOverlayCounter = 0;
     _tileOverlayCounter++;
 
@@ -449,6 +583,8 @@ class MapViewModel extends ChangeNotifier {
         _highlightCache[z]!.add('${parentLat}_${parentLng}');
       }
     }
+    // highlight 集合は PNG キャッシュキーに含まれないので、明示破棄する。
+    _clearTilePngCache();
   }
 
   // --- Helpers: Web Mercator forward + cell rect in this tile ---
@@ -465,120 +601,120 @@ class MapViewModel extends ChangeNotifier {
   }
 
   /// タイルの画像データを生成して返すメソッド
+  ///
+  /// メインスレッドでは DB フェッチ (shard キャッシュヒット時はほぼ即時) と
+  /// content hash 計算のみ行い、PNG が既にキャッシュされていれば即座に返す。
+  /// キャッシュミス時のみセル配列のパッキングを経て、実際の Canvas ラスタライズと
+  /// PNG エンコードを `TileRasterizerPool` の背景 isolate にオフロードする。
+  ///
+  /// GM は TileOverlayId が変わると全可視タイルを再要求するが、
+  /// 大半のタイルは内容が変わっていないため hash hit で即返せる。
+  /// 実質「変更があった Tile だけ再生成」が達成される。
   Future<Tile> getTile(int tileX, int tileY, int? zoomDesc) async {
-    // 画質維持のため 512 固定。PNG エンコードは後段の isolate pool で
-    // level 0 並列化することで短縮する。
-    const int ts = 512;
+    final int ts = _tileResolution;
 
-    if (zoomDesc == null) {
-      // 描画不要: null data で空タイル扱い（PNG 生成スキップ）。
-      return const Tile(512, 512, null);
-    }
+    if (_isBusy) return Tile(ts, ts, null);
+    if (zoomDesc == null) return Tile(ts, ts, null);
 
-    // Zoomレベルの決定: 3..14 にクランプ（手動モード時は固定値）
     final int tileZ = zoomDesc;
     final int cellZ = _isManualCellSize ? _manualCellZ : tileZ.clamp(3, 14);
 
-    // データを取得
     final cells =
         await _databaseRepository.fetchCells(tileZ, cellZ, tileX, tileY);
 
-    if (cells.isEmpty) {
-      // セル 0 件 → PNG 生成せず null data で透明タイルを返す。
-      // これだけで、データ未到達エリアの描画コストがほぼ 0 になる。
-      return const Tile(512, 512, null);
+    if (cells.isEmpty) return Tile(ts, ts, null);
+
+    final bool hideStroke = shouldHideCellStroke(tileZ);
+    final bool delete = isDeleteSectionMode;
+
+    // キャッシュキー。ハイライトは set の内容ではなくズーム毎のハッシュを含める
+    // ほうが厳密だが、delete モード出入りで `_clearTilePngCache` を呼んでおけば
+    // 同 cellZ 内では highlight 集合は単調に増減するだけなので、
+    // 簡略化して `delete` フラグのみで十分。
+    final String key =
+        '$ts-$tileZ-$cellZ-$tileX-$tileY-${hideStroke ? 1 : 0}-${delete ? 1 : 0}';
+
+    // content hash: (lat, lng, val) を 3 つとも混ぜる。
+    // shard キャッシュヒット時は同じ Cell インスタンスを再利用するので順序も安定。
+    int contentHash = cells.length;
+    for (final c in cells) {
+      contentHash = (contentHash * 1000003) ^ c.lat;
+      contentHash = (contentHash * 1000003) ^ c.lng;
+      contentHash = (contentHash * 1000003) ^ c.val;
     }
 
-    final recorder = ui.PictureRecorder();
-    final canvas = Canvas(recorder);
-
-    // Paint をループ外で 1 度だけ確保して使い回す（GC 圧力削減）。
-    final Paint paintFill = Paint()..style = PaintingStyle.fill;
-    final Paint paintStroke = Paint()
-      ..color = Colors.black.withValues(alpha: 0.3)
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 0.5;
-    final Paint paintHighlight = Paint()
-      ..color = Colors.red
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 2.0;
-
-    // 手動モードで cellZ が自動より細かい場合、境界線が密集して見づらいので
-    // ストロークを描かない。また、セル密集時（500+）は drawRect × stroke が
-    // PictureRecorder コスト支配要因になるため自動的にスキップする。
-    final bool hideStroke = shouldHideCellStroke(tileZ) || cells.length > 500;
-
-    final double tsD = ts.toDouble();
-    final double tileOriginX = tileX * tsD;
-    final double tileOriginY = tileY * tsD;
-
-    Rect cellRectInThisTile(int latIndex, int lngIndex) {
-      final LatLngBounds b = _cellToLatLngBounds(cellZ, latIndex, lngIndex);
-      final Point<double> sw = latLngToWorldPixel(
-          b.southwest.latitude, b.southwest.longitude, tileZ, ts);
-      final Point<double> ne = latLngToWorldPixel(
-          b.northeast.latitude, b.northeast.longitude, tileZ, ts);
-
-      final double pxW = sw.x - tileOriginX;
-      final double pyS = sw.y - tileOriginY;
-      final double pxE = ne.x - tileOriginX;
-      final double pyN = ne.y - tileOriginY;
-
-      final double left = min(pxW, pxE);
-      final double top = min(pyN, pyS);
-      final double width = (pxE - pxW).abs();
-      final double height = (pyS - pyN).abs();
-      return Rect.fromLTWH(left, top, width, height);
+    final cached = _tilePngCache[key];
+    if (cached != null && cached.contentHash == contentHash) {
+      // LRU 最新側に移動するため remove→put
+      _tilePngCache.remove(key);
+      _tilePngCache[key] = cached;
+      return Tile(ts, ts, cached.png);
     }
 
-    final Set<String>? highlightSetForZ =
-        isDeleteSectionMode ? _highlightCache[cellZ] : null;
-
+    // Int32List へパック: [lat, lng, val, lat, lng, val, ...]
+    final Int32List packed = Int32List(cells.length * 3);
+    int pi = 0;
     for (final cell in cells) {
-      final Rect r = cellRectInThisTile(cell.lat, cell.lng);
-      if (r.right <= 0 || r.bottom <= 0 || r.left >= ts || r.top >= ts) {
-        continue;
-      }
+      packed[pi++] = cell.lat;
+      packed[pi++] = cell.lng;
+      packed[pi++] = cell.val;
+    }
 
-      paintFill.color = _calculateCellColor(cell.val, cellZ);
-      canvas.drawRect(r, paintFill);
-
-      if (!hideStroke) {
-        canvas.drawRect(r, paintStroke);
-      }
-
-      if (highlightSetForZ != null &&
-          highlightSetForZ.contains('${cell.lat}_${cell.lng}')) {
-        canvas.drawRect(r, paintHighlight);
+    Int32List? hiPacked;
+    if (delete) {
+      final hset = _highlightCache[cellZ];
+      if (hset != null && hset.isNotEmpty) {
+        hiPacked = Int32List(hset.length * 2);
+        int hi = 0;
+        for (final s in hset) {
+          final sep = s.indexOf('_');
+          if (sep <= 0) continue;
+          hiPacked[hi++] = int.parse(s.substring(0, sep));
+          hiPacked[hi++] = int.parse(s.substring(sep + 1));
+        }
       }
     }
 
-    // 以下で PNG を生成する。Flutter 標準の `ui.ImageByteFormat.png` は
-    // メイン isolate で zlib 圧縮まで行うためズーム変更時のボトルネックになる。
-    // そこで rawStraightRgba で raw ピクセルだけ取り出し、圧縮レベル 0 の PNG
-    // エンコードを別 isolate pool で並列実行する。
-    final picture = recorder.endRecording();
-    final image = await picture.toImage(ts, ts);
-    try {
-      final rgbaByteData =
-          await image.toByteData(format: ui.ImageByteFormat.rawStraightRgba);
-      if (rgbaByteData == null) return const Tile(512, 512, null);
-      final rgba = rgbaByteData.buffer.asUint8List();
-      final pngBytes =
-          await PngEncoderPool.instance.encode(rgba, ts, ts);
-      return Tile(ts, ts, pngBytes);
-    } finally {
-      image.dispose();
+    final pngBytes = await TileRasterizerPool.instance.rasterize(
+      ts: ts,
+      tileX: tileX,
+      tileY: tileY,
+      tileZ: tileZ,
+      cellZ: cellZ,
+      cells: packed,
+      hideStroke: hideStroke,
+      highlights: hiPacked,
+    );
+
+    // LRU に保存（上限超過なら最古を捨てる）。
+    _tilePngCache[key] =
+        _TilePngEntry(contentHash: contentHash, png: pngBytes);
+    while (_tilePngCache.length > _tilePngCacheCap) {
+      _tilePngCache.remove(_tilePngCache.keys.first);
     }
+
+    return Tile(ts, ts, pngBytes);
+  }
+
+  /// タイル PNG キャッシュを完全に破棄する。
+  /// ts / manualCellZ / delete モード状態などキー外のパラメータが変わった時に呼ぶ。
+  void _clearTilePngCache() {
+    _tilePngCache.clear();
   }
 
   /// `flutter_map` 向け: タイル画像を直接 `ui.Image` として返す。
   /// PNG エンコード/デコードのオーバーヘッドを回避する。
   Future<ui.Image> getTileImage(int tileX, int tileY, int zoomDesc) async {
-    const int ts = 512;
+    final int ts = _tileResolution;
 
     final recorder = ui.PictureRecorder();
     final canvas = Canvas(recorder);
+
+    if (_isBusy) {
+      // 空の絵のまま 1x1 相当の透明画像を返す（DB アクセスは行わない）。
+      final picture = recorder.endRecording();
+      return picture.toImage(ts, ts);
+    }
 
     final int tileZ = zoomDesc;
     final int cellZ = _isManualCellSize ? _manualCellZ : tileZ.clamp(3, 14);
@@ -704,6 +840,7 @@ class MapViewModel extends ChangeNotifier {
   /// 自動で地図ズームに合わせる。手動モードでは auto-zoom-down は行わない。
   Future<List<CellPolygon>> fetchCellPolygons(
       double south, double north, double west, double east, int zoom) async {
+    if (_isBusy) return const <CellPolygon>[];
     final int cellZ = _isManualCellSize ? _manualCellZ : zoom.clamp(3, 14);
 
     // タイル座標は地図ズームを基準にする（getTile と同じ考え方）
@@ -792,4 +929,13 @@ class _HeatmapTileProvider implements TileProvider {
   Future<Tile> getTile(int x, int y, int? zoom) {
     return _viewModel.getTile(x, y, zoom);
   }
+}
+
+/// Per-Tile PNG LRU キャッシュのエントリ。
+/// `contentHash` は fetchCells で得たセル配列内容のハッシュ。
+/// これが前回と一致すれば、そのタイルは再生成不要 (= 変更なし) と判断できる。
+class _TilePngEntry {
+  const _TilePngEntry({required this.contentHash, required this.png});
+  final int contentHash;
+  final Uint8List png;
 }

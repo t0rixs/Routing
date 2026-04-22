@@ -49,19 +49,29 @@ class _MapWidgetState extends State<MapWidget> {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<MapViewModel>(
-      builder: (context, viewModel, child) {
-        return Stack(
-          children: [
-            GoogleMap(
-              initialCameraPosition: viewModel.cameraPosition,
+    // GoogleMap は Consumer の外に置く。
+    // Consumer で包むと `notifyListeners()` (GPS 1Hz / follow tick / delete
+    // mode 切替等) 毎に GoogleMap が rebuild され、プラットフォームビューの
+    // ジェスチャ処理と競合して指追従が遅れていた。
+    // tileOverlay だけを Selector で監視し、必要なときだけ GoogleMap に
+    // 新しい overlay を渡す（旧 overlay 参照が同じなら Selector 自体が
+    // rebuild しないので GoogleMap も動かない）。
+    final vm = _mapViewModel ?? context.read<MapViewModel>();
+    return Stack(
+      children: [
+        Selector<MapViewModel, TileOverlay?>(
+          selector: (_, v) => v.tileOverlay,
+          builder: (context, tileOverlay, _) {
+            return GoogleMap(
+              initialCameraPosition: vm.cameraPosition,
               onMapCreated: (controller) {
                 _controller = controller;
-                viewModel.onMapCreated(controller);
+                vm.onMapCreated(controller);
               },
-              onCameraMove: viewModel.onCameraMove,
+              onCameraMoveStarted: vm.onCameraMoveStarted,
+              onCameraMove: vm.onCameraMove,
               onCameraIdle: () async {
-                viewModel.onCameraIdle();
+                vm.onCameraIdle();
                 // ビューポート範囲を取得して shard プリフェッチを起動する。
                 // 続けて要求される getTile が DB に行かずキャッシュヒットするため、
                 // ズーム変更直後の描画時間を大きく短縮できる。
@@ -69,167 +79,176 @@ class _MapWidgetState extends State<MapWidget> {
                   final controller = _controller;
                   if (controller != null) {
                     final bounds = await controller.getVisibleRegion();
-                    viewModel.requestViewportPrefetch(bounds);
+                    vm.requestViewportPrefetch(bounds);
                   }
                 } catch (_) {}
               },
-              onTap: (latLng) async {
-                // タップしたセルの情報を取得
-                final cell = await viewModel.onTap(latLng);
-                if (context.mounted && cell != null) {
-                  showDialog(
-                    context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: const Text('Cell Info'),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Value: ${cell.val}'),
-                          Text('Lat Index: ${cell.lat}'),
-                          Text('Lng Index: ${cell.lng}'),
-                          if (cell.p1 != null && cell.p1! > 0)
-                            Text(
-                                '初回更新: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.p1!))}'),
-                          Text(
-                              '最終更新時間: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.tm))}'),
-                          GestureDetector(
-                            onTap: () {
-                              Navigator.of(ctx).pop(); // ダイアログを閉じる
-                              viewModel.startDeleteSectionMode(cell);
-                            },
-                            child: const Padding(
-                              padding: EdgeInsets.only(top: 8.0),
-                              child: Text('区間削除',
-                                  style: TextStyle(color: Colors.blue)),
-                            ),
-                          ),
-                        ],
-                      ),
-                      actions: [
-                        TextButton(
-                          child: const Text('Close'),
-                          onPressed: () => Navigator.of(ctx).pop(),
-                        ),
-                      ],
-                    ),
-                  );
-                }
-              },
+              onTap: (latLng) => _handleMapTap(context, vm, latLng),
               tileOverlays:
-                  viewModel.tileOverlay != null ? {viewModel.tileOverlay!} : {},
+                  tileOverlay != null ? {tileOverlay} : const <TileOverlay>{},
               myLocationEnabled: true,
               myLocationButtonEnabled: true,
               zoomControlsEnabled: false,
               compassEnabled: true,
               mapToolbarEnabled: false,
-            ),
-            if (viewModel.isDeleteSectionMode)
-              Positioned(
-                top: 50,
-                left: 20,
-                right: 20,
-                child: Card(
-                  color: Colors.white.withOpacity(0.9),
-                  child: Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          viewModel.isDeleteReady
-                              ? '削除範囲が選択されました'
-                              : '区間の終点を選択してください',
-                          style: const TextStyle(
-                              fontSize: 16, fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 10),
-                        if (viewModel.isDeleteReady)
-                          ElevatedButton(
-                            style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.red,
-                                foregroundColor: Colors.white),
-                            child: Text(
-                                '削除実行 (${viewModel.highlightCells.length} cells)'),
-                            onPressed: () {
-                              showDialog(
-                                context: context,
-                                builder: (ctx) => AlertDialog(
-                                  title: const Text('区間削除'),
-                                  content: Text(
-                                      '選択された範囲のデータを削除しますか？\nこの操作は取り消せません。\n対象セル数: ${viewModel.highlightCells.length}'),
-                                  actions: [
-                                    TextButton(
-                                        child: const Text('キャンセル'),
-                                        onPressed: () =>
-                                            Navigator.of(ctx).pop()),
-                                    TextButton(
-                                        child: const Text('実行',
-                                            style:
-                                                TextStyle(color: Colors.red)),
-                                        onPressed: () {
-                                          Navigator.of(ctx)
-                                              .pop(); // 確認ダイアログを閉じる
-
-                                          // 処理中ダイアログを表示
-                                          showDialog(
-                                            context: context,
-                                            barrierDismissible: false,
-                                            builder: (BuildContext context) {
-                                              return _ProgressDialogContent(
-                                                viewModel: viewModel,
-                                              );
-                                            },
-                                          );
-                                        }),
-                                  ],
-                                ),
-                              );
-                            },
-                          ),
-                        TextButton(
-                          child: const Text('キャンセル'),
-                          onPressed: () => viewModel.cancelDeleteSectionMode(),
-                        )
-                      ],
-                    ),
-                  ),
-                ),
-              ),
-            const Positioned(
-              bottom: 16,
-              left: 16,
-              child: CellSizeControl(),
-            ),
-            Positioned(
-              // Scaffold 側の menu FAB と重ならないように上に積む
-              bottom: 80,
-              right: 16,
-              child: FloatingActionButton(
+            );
+          },
+        ),
+        // 削除モード UI は専用の Consumer で包む。
+        // 状態変化は稀なので rebuild コストは無視できる。
+        Consumer<MapViewModel>(
+          builder: (context, v, _) {
+            if (!v.isDeleteSectionMode) return const SizedBox.shrink();
+            return _DeleteSectionOverlay(viewModel: v);
+          },
+        ),
+        const Positioned(
+          bottom: 16,
+          left: 16,
+          child: CellSizeControl(),
+        ),
+        // Follow ボタンも独立させる。GoogleMap は rebuild されない。
+        Positioned(
+          bottom: 80,
+          right: 16,
+          child: Consumer<MapViewModel>(
+            builder: (context, v, _) {
+              return FloatingActionButton(
                 heroTag: 'followUserFab',
                 mini: true,
-                backgroundColor:
-                    viewModel.followUser ? Colors.blue : Colors.white,
-                foregroundColor:
-                    viewModel.followUser ? Colors.white : Colors.blue,
-                tooltip: viewModel.followUser ? '追従中（タップで解除）' : '現在地に追従',
+                backgroundColor: v.followUser ? Colors.blue : Colors.white,
+                foregroundColor: v.followUser ? Colors.white : Colors.blue,
+                tooltip: v.followUser ? '追従中（タップで解除）' : '現在地に追従',
                 onPressed: () {
-                  viewModel.toggleFollowUser();
-                  final pos = viewModel.lastKnownPosition;
-                  if (viewModel.followUser && pos != null) {
+                  v.toggleFollowUser();
+                  final pos = v.lastKnownPosition;
+                  if (v.followUser && pos != null) {
                     _controller?.animateCamera(CameraUpdate.newLatLng(pos));
                   }
                 },
                 child: Icon(
-                  viewModel.followUser
-                      ? Icons.gps_fixed
-                      : Icons.gps_not_fixed,
+                  v.followUser ? Icons.gps_fixed : Icons.gps_not_fixed,
                 ),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _handleMapTap(
+      BuildContext context, MapViewModel viewModel, LatLng latLng) async {
+    final cell = await viewModel.onTap(latLng);
+    if (!context.mounted || cell == null) return;
+    showDialog(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Cell Info'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Value: ${cell.val}'),
+            Text('Lat Index: ${cell.lat}'),
+            Text('Lng Index: ${cell.lng}'),
+            if (cell.p1 != null && cell.p1! > 0)
+              Text(
+                  '初回更新: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.p1!))}'),
+            Text(
+                '最終更新時間: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.tm))}'),
+            GestureDetector(
+              onTap: () {
+                Navigator.of(ctx).pop();
+                viewModel.startDeleteSectionMode(cell);
+              },
+              child: const Padding(
+                padding: EdgeInsets.only(top: 8.0),
+                child: Text('区間削除', style: TextStyle(color: Colors.blue)),
               ),
             ),
           ],
-        );
-      },
+        ),
+        actions: [
+          TextButton(
+            child: const Text('Close'),
+            onPressed: () => Navigator.of(ctx).pop(),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DeleteSectionOverlay extends StatelessWidget {
+  const _DeleteSectionOverlay({required this.viewModel});
+  final MapViewModel viewModel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Positioned(
+      top: 50,
+      left: 20,
+      right: 20,
+      child: Card(
+        color: Colors.white.withValues(alpha: 0.9),
+        child: Padding(
+          padding: const EdgeInsets.all(16.0),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                viewModel.isDeleteReady ? '削除範囲が選択されました' : '区間の終点を選択してください',
+                style: const TextStyle(
+                    fontSize: 16, fontWeight: FontWeight.bold),
+              ),
+              const SizedBox(height: 10),
+              if (viewModel.isDeleteReady)
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white),
+                  child: Text(
+                      '削除実行 (${viewModel.highlightCells.length} cells)'),
+                  onPressed: () {
+                    showDialog(
+                      context: context,
+                      builder: (ctx) => AlertDialog(
+                        title: const Text('区間削除'),
+                        content: Text(
+                            '選択された範囲のデータを削除しますか？\nこの操作は取り消せません。\n対象セル数: ${viewModel.highlightCells.length}'),
+                        actions: [
+                          TextButton(
+                              child: const Text('キャンセル'),
+                              onPressed: () => Navigator.of(ctx).pop()),
+                          TextButton(
+                              child: const Text('実行',
+                                  style: TextStyle(color: Colors.red)),
+                              onPressed: () {
+                                Navigator.of(ctx).pop();
+                                showDialog(
+                                  context: context,
+                                  barrierDismissible: false,
+                                  builder: (BuildContext context) {
+                                    return _ProgressDialogContent(
+                                      viewModel: viewModel,
+                                    );
+                                  },
+                                );
+                              }),
+                        ],
+                      ),
+                    );
+                  },
+                ),
+              TextButton(
+                child: const Text('キャンセル'),
+                onPressed: () => viewModel.cancelDeleteSectionMode(),
+              )
+            ],
+          ),
+        ),
+      ),
     );
   }
 }

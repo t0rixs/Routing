@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
+import '../../repositories/database_repository.dart';
 import '../../viewmodels/import_export_view_model.dart';
 import '../../viewmodels/map_view_model.dart';
 
@@ -34,23 +35,29 @@ class MenuDrawer extends StatelessWidget {
               }
               _isImporting = true;
 
-              // Contextが有効なうちにViewModel・Navigator・Messenger を取得しておく
+              // Contextが有効なうちにViewModel・Messenger を取得しておく
               final importVm =
                   Provider.of<ImportExportViewModel>(context, listen: false);
               final mapVm = Provider.of<MapViewModel>(context, listen: false);
               final messenger = ScaffoldMessenger.of(context);
-              // NavigatorState を事前に捕捉（準備ダイアログの pop で使用）
-              final navigator = Navigator.of(context, rootNavigator: true);
 
               Navigator.pop(context); // Close drawer
 
               debugPrint('Menu: Import tapped, drawer closed. Waiting...');
 
+              // ピッカーを開くより先に busy にする。
+              // 理由: FilePicker の表示中（数秒〜数十秒）も GPS は発火し続け、
+              // _recordCellsForMovement が大量の DB 書き込みを
+              // メインスレッドにキューイングしてしまう。
+              // その結果、選択確定直後に closeAll と importFile を呼んでも、
+              // キューが捌けるまで overlay の再描画フレームが走らない。
+              // ここで先行停止することで、ピッカー表示中にバックログが溜まらない。
+              await mapVm.setBusy(true);
+              bool busyActivated = true;
+
               // ファイルピッカー起動
               // "File picker already active" エラー回避のため少し待つ
               await Future.delayed(const Duration(milliseconds: 500));
-
-              bool prepDialogShown = false;
 
               try {
                 debugPrint('Menu: Opening file picker...');
@@ -61,39 +68,13 @@ class MenuDrawer extends StatelessWidget {
                   final path = result.files.single.path!;
                   debugPrint('Menu: File picked: $path');
 
-                  // importFile 内部の同期重処理（ZIP 展開など）でメインスレッドが
-                  // ブロックされ、ImportExportViewModel 経由のオーバーレイ描画が
-                  // 遅延するケースへの保険として、ここで即時ダイアログを起動する。
-                  // await しないことで非同期に描画キューへ積まれ、直後の
-                  // importFile 呼び出しより先にフレームが描画される。
-                  if (context.mounted) {
-                    prepDialogShown = true;
-                    // ignore: use_build_context_synchronously
-                    showDialog<void>(
-                      context: context,
-                      barrierDismissible: false,
-                      builder: (_) => const _ImportPrepDialog(),
-                    );
-                    // 1 フレーム譲って、ダイアログが確実に表示されてから
-                    // 重処理に突入する。
-                    await WidgetsBinding.instance.endOfFrame;
-                  }
-
-                  try {
-                    await importVm.importFile(path);
-                  } finally {
-                    if (prepDialogShown) {
-                      navigator.pop();
-                      prepDialogShown = false;
-                    }
-                  }
+                  await importVm.importFile(path);
 
                   if (importVm.successMessage != null) {
                     debugPrint('Menu: Import success');
                     messenger.showSnackBar(
                       SnackBar(content: Text(importVm.successMessage!)),
                     );
-                    mapVm.refreshMap();
                   } else if (importVm.errorMessage != null) {
                     debugPrint('Menu: Import failed: ${importVm.errorMessage}');
                     messenger.showSnackBar(
@@ -106,10 +87,6 @@ class MenuDrawer extends StatelessWidget {
                   debugPrint('Menu: File picker cancelled or no file selected');
                 }
               } catch (e) {
-                if (prepDialogShown) {
-                  navigator.pop();
-                  prepDialogShown = false;
-                }
                 debugPrint('Pick file error: $e');
                 messenger.showSnackBar(
                   SnackBar(
@@ -117,6 +94,11 @@ class MenuDrawer extends StatelessWidget {
                       backgroundColor: Colors.red),
                 );
               } finally {
+                if (busyActivated) {
+                  // GPS 再開 + TileOverlay 再生成（新しい DB から描画が組み立てられる）
+                  await mapVm.setBusy(false);
+                  mapVm.refreshMap();
+                }
                 _isImporting = false;
               }
             },
@@ -130,9 +112,15 @@ class MenuDrawer extends StatelessWidget {
 
               final importVm =
                   Provider.of<ImportExportViewModel>(context, listen: false);
+              final mapVm = Provider.of<MapViewModel>(context, listen: false);
 
-              // エクスポート実行
-              await importVm.exportFile();
+              // エクスポート中も GPS と描画を停止する（DB を close するため）。
+              await mapVm.setBusy(true);
+              try {
+                await importVm.exportFile();
+              } finally {
+                await mapVm.setBusy(false);
+              }
 
               if (!context.mounted) return;
 
@@ -149,33 +137,100 @@ class MenuDrawer extends StatelessWidget {
               }
             },
           ),
+          const Divider(),
+          // 解像度選択: ExpansionTile 内に 3 択のラジオ風 ListTile を並べる
+          Consumer<MapViewModel>(
+            builder: (context, vm, _) {
+              return ExpansionTile(
+                leading: const Icon(Icons.hd),
+                title: const Text('タイル解像度'),
+                subtitle: Text(_resolutionLabel(vm.tileResolution)),
+                children: [
+                  for (final int ts in MapViewModel.tileResolutionOptions)
+                    ListTile(
+                      dense: true,
+                      contentPadding:
+                          const EdgeInsets.only(left: 72, right: 16),
+                      title: Text(_resolutionLabel(ts)),
+                      trailing: vm.tileResolution == ts
+                          ? const Icon(Icons.check, color: Colors.blue)
+                          : null,
+                      onTap: () => vm.setTileResolution(ts),
+                    ),
+                ],
+              );
+            },
+          ),
+          const Divider(),
+          ListTile(
+            leading: const Icon(Icons.delete_forever, color: Colors.red),
+            title: const Text('全記録をクリア',
+                style: TextStyle(color: Colors.red)),
+            subtitle: const Text('すべての DB を削除します'),
+            onTap: () async {
+              final mapVm =
+                  Provider.of<MapViewModel>(context, listen: false);
+              final messenger = ScaffoldMessenger.of(context);
+              final navigator = Navigator.of(context);
+
+              // 確認ダイアログ
+              final confirmed = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('全記録をクリア'),
+                  content: const Text(
+                      '記録済みのデータを全て削除します。この操作は取り消せません。よろしいですか？'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(false),
+                      child: const Text('キャンセル'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(true),
+                      child: const Text('削除する',
+                          style: TextStyle(color: Colors.red)),
+                    ),
+                  ],
+                ),
+              );
+
+              if (confirmed != true) return;
+
+              navigator.pop(); // drawer を閉じる
+
+              await mapVm.setBusy(true);
+              try {
+                await DatabaseRepository().clearAllData();
+                messenger.showSnackBar(
+                  const SnackBar(content: Text('全ての記録を削除しました')),
+                );
+              } catch (e) {
+                messenger.showSnackBar(
+                  SnackBar(
+                      content: Text('削除失敗: $e'),
+                      backgroundColor: Colors.red),
+                );
+              } finally {
+                await mapVm.setBusy(false);
+                mapVm.refreshMap();
+              }
+            },
+          ),
         ],
       ),
     );
   }
-}
 
-/// インポート開始直後に表示する軽量ダイアログ。
-/// `ImportExportViewModel` のオーバーレイが現れるまでのギャップを埋める役割。
-class _ImportPrepDialog extends StatelessWidget {
-  const _ImportPrepDialog();
-
-  @override
-  Widget build(BuildContext context) {
-    return const AlertDialog(
-      content: Row(
-        children: [
-          SizedBox(
-            width: 24,
-            height: 24,
-            child: CircularProgressIndicator(strokeWidth: 3),
-          ),
-          SizedBox(width: 16),
-          Expanded(
-            child: Text('インポート準備中...\nファイルを展開しています'),
-          ),
-        ],
-      ),
-    );
+  static String _resolutionLabel(int ts) {
+    switch (ts) {
+      case 320:
+        return '低 (320px)';
+      case 480:
+        return '中 (480px)';
+      case 512:
+        return '高 (512px)';
+      default:
+        return '${ts}px';
+    }
   }
 }
