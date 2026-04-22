@@ -9,8 +9,10 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
+import 'package:permission_handler/permission_handler.dart' as ph;
 import '../models/cell.dart';
 import '../repositories/database_repository.dart';
+import '../services/background_activity_service.dart';
 import '../services/tile_rasterizer_pool.dart';
 import '../utils/cell_index.dart';
 
@@ -212,6 +214,12 @@ class MapViewModel extends ChangeNotifier {
             notificationTitle: 'Routing',
             notificationText: '移動履歴を記録中...',
             enableWakeLock: true,
+            // 通知チャンネル名を明示。Android 8+ ではチャンネル未指定だと
+            // OS がデフォルト扱いで通知を弾く場合があるため必須レベル。
+            notificationChannelName: 'Routing 位置情報サービス',
+            // ユーザが誤って通知をスワイプで消せないようにする
+            // (foreground service の通知はスワイプ削除禁止が推奨)。
+            setOngoing: true,
             notificationIcon: AndroidResource(
               name: 'ic_launcher',
               defType: 'mipmap',
@@ -242,6 +250,17 @@ class MapViewModel extends ChangeNotifier {
     if (!(defaultTargetPlatform == TargetPlatform.android ||
         defaultTargetPlatform == TargetPlatform.iOS)) {
       return;
+    }
+
+    // Android 13+ は通知を出すのに POST_NOTIFICATIONS ランタイム許可が必須。
+    // これがないと foreground service は起動しても通知バーに表示されず、
+    // ユーザから見ると「アプリを閉じたら全て止まった」ように見える。
+    // 位置情報許可より先に済ませておく。
+    if (defaultTargetPlatform == TargetPlatform.android) {
+      final notifStatus = await ph.Permission.notification.status;
+      if (!notifStatus.isGranted) {
+        await ph.Permission.notification.request();
+      }
     }
 
     var permission = await Geolocator.checkPermission();
@@ -301,8 +320,20 @@ class MapViewModel extends ChangeNotifier {
   /// パンした際、`requestViewportPrefetch` が最新データを再ロードする。
   Future<void> _recordCellsForMovement(LatLng from, LatLng to) async {
     final cells = CellIndex.cellsOnSegment(from, to);
+
+    // `from` が属するセルは前回の位置更新時に既に記録済みなので除外する。
+    // これにより、同一 cell に滞在している間は記録が発生せず、
+    // cell を跨ぎ越した時だけ新規セルに対して初回の記録が走る。
+    final fromCell = CellIndex.latLngToIndices14(from);
+    cells.remove(fromCell);
+
     if (cells.isEmpty) return;
-    await _databaseRepository.recordVisitedCells14(cells);
+    BackgroundActivityService.instance.begin();
+    try {
+      await _databaseRepository.recordVisitedCells14(cells);
+    } finally {
+      BackgroundActivityService.instance.end();
+    }
 
     if (!_anyCellInVisibleBounds(cells)) {
       // 画面外の記録 → 描画トリガは発行しない。
@@ -422,13 +453,17 @@ class MapViewModel extends ChangeNotifier {
     _lastPrefetchDbLngStart = dbLngStart;
     _lastPrefetchDbLngEnd = dbLngEnd;
 
-    unawaited(_databaseRepository.prefetchShards(
-      cellZ: cellZ,
-      sLat: sLat,
-      nLat: nLat,
-      wLng: wLng,
-      eLng: eLng,
-    ));
+    // Activity を登録し、非同期完了時に end() を必ず呼ぶ。
+    BackgroundActivityService.instance.begin();
+    unawaited(_databaseRepository
+        .prefetchShards(
+          cellZ: cellZ,
+          sLat: sLat,
+          nLat: nLat,
+          wLng: wLng,
+          eLng: eLng,
+        )
+        .whenComplete(() => BackgroundActivityService.instance.end()));
   }
 
   /// タイルオーバーレイを更新 (再描画)。
@@ -489,11 +524,13 @@ class MapViewModel extends ChangeNotifier {
 
   Future<void> executeDeleteSection({Function(int, int)? onProgress}) async {
     if (_highlightCells.isEmpty) return;
-
-    await _databaseRepository.deleteCells(_highlightCells.toList(),
-        onProgress: onProgress);
-
-    // 完了処理
+    BackgroundActivityService.instance.begin();
+    try {
+      await _databaseRepository.deleteCells(_highlightCells.toList(),
+          onProgress: onProgress);
+    } finally {
+      BackgroundActivityService.instance.end();
+    }
     cancelDeleteSectionMode();
     _refreshTileOverlay();
   }

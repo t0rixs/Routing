@@ -5,6 +5,8 @@ import 'dart:typed_data';
 
 import 'package:image/image.dart' as img;
 
+import 'background_activity_service.dart';
+
 /// タイル 1 枚分の描画 (RGBA 塗り) + PNG エンコードを背景 isolate で実行するプール。
 ///
 /// 目的:
@@ -62,18 +64,25 @@ class TileRasterizerPool {
     Int32List? highlights,
   }) async {
     await _ensureInit();
-    final worker = _workers[_rrIndex];
-    _rrIndex = (_rrIndex + 1) % _workers.length;
-    return worker.rasterize(
-      ts: ts,
-      tileX: tileX,
-      tileY: tileY,
-      tileZ: tileZ,
-      cellZ: cellZ,
-      cells: cells,
-      hideStroke: hideStroke,
-      highlights: highlights,
-    );
+    // 1 タイル生成ごとに Activity を登録。大量にタイルが並列で流れても
+    // BackgroundActivityService 側で参照カウントされ、全完了まで可視維持される。
+    BackgroundActivityService.instance.begin();
+    try {
+      final worker = _workers[_rrIndex];
+      _rrIndex = (_rrIndex + 1) % _workers.length;
+      return await worker.rasterize(
+        ts: ts,
+        tileX: tileX,
+        tileY: tileY,
+        tileZ: tileZ,
+        cellZ: cellZ,
+        cells: cells,
+        hideStroke: hideStroke,
+        highlights: highlights,
+      );
+    } finally {
+      BackgroundActivityService.instance.end();
+    }
   }
 }
 
@@ -266,6 +275,15 @@ Uint8List _rasterizeTile(_RasterizeRequest req) {
 
     if (right <= 0 || bottom <= 0 || left >= tsD || top >= tsD) continue;
 
+    // cell の各辺が tile 内に「実在」するかを、クランプ前に判定しておく。
+    // これを見ずに単にクランプ後の矩形に stroke を引くと、
+    // cell が tile より大きい (拡大率 > cellZ で顕著) 場合に
+    // tile の端そのものに stroke が描かれ、謎の縦横線として可視化される。
+    final bool edgeTop = top >= 0;
+    final bool edgeBottom = bottom <= tsD;
+    final bool edgeLeft = left >= 0;
+    final bool edgeRight = right <= tsD;
+
     // 隣接セル同士が 1px 隙間にならないよう floor/ceil で外側に丸める。
     int iLeft = left.floor();
     int iTop = top.floor();
@@ -298,13 +316,22 @@ Uint8List _rasterizeTile(_RasterizeRequest req) {
 
     if (!hideStroke) {
       // 0.3 alpha 黒の枠線を 1px 分だけ塗る。掛け算 × 0.7 ≒ × 7/10 で近似。
-      _strokeRect(buf, ts, iLeft, iTop, iRight, iBottom);
+      // tile にクランプされた辺 (cell の真の境界ではない) には描かない。
+      _strokeRect(buf, ts, iLeft, iTop, iRight, iBottom,
+          drawTop: edgeTop,
+          drawBottom: edgeBottom,
+          drawLeft: edgeLeft,
+          drawRight: edgeRight);
     }
 
     if (hset != null && hset.contains(_cellKey(latIdx, lngIdx))) {
       // 削除モードの赤枠 (2px)。main と同様の視覚表現。
       _strokeRectColor(buf, ts, iLeft, iTop, iRight, iBottom,
-          r: 255, g: 0, b: 0, thickness: 2);
+          r: 255, g: 0, b: 0, thickness: 2,
+          drawTop: edgeTop,
+          drawBottom: edgeBottom,
+          drawLeft: edgeLeft,
+          drawRight: edgeRight);
     }
   }
 
@@ -367,10 +394,18 @@ _Rgb _hsvToRgb(double h, double s, double v) {
 
 /// 既存塗り上に「黒 0.3 alpha」相当の 1px 枠をブレンドする。
 /// 実数演算を避けて integer (×7~/10) で近似。
+///
+/// [drawTop]/[drawBottom]/[drawLeft]/[drawRight] はクランプ前の cell 境界が
+/// tile 内に存在するかどうか。tile 端にクランプされただけの辺に stroke を描くと
+/// tile 境界上に疑似的な縦横線が現れるため、false の辺は描かない。
 void _strokeRect(
-    Uint8List buf, int ts, int left, int top, int right, int bottom) {
+    Uint8List buf, int ts, int left, int top, int right, int bottom,
+    {required bool drawTop,
+    required bool drawBottom,
+    required bool drawLeft,
+    required bool drawRight}) {
   // 上辺
-  if (top >= 0 && top < ts) {
+  if (drawTop && top >= 0 && top < ts) {
     int idx = (top * ts + left) * 4;
     for (int x = left; x < right; x++) {
       buf[idx] = (buf[idx] * 7) ~/ 10;
@@ -382,7 +417,7 @@ void _strokeRect(
   }
   // 下辺
   final int by = bottom - 1;
-  if (by >= 0 && by < ts && by != top) {
+  if (drawBottom && by >= 0 && by < ts && by != top) {
     int idx = (by * ts + left) * 4;
     for (int x = left; x < right; x++) {
       buf[idx] = (buf[idx] * 7) ~/ 10;
@@ -393,7 +428,7 @@ void _strokeRect(
     }
   }
   // 左辺
-  if (left >= 0 && left < ts) {
+  if (drawLeft && left >= 0 && left < ts) {
     for (int y = top; y < bottom; y++) {
       final int idx = (y * ts + left) * 4;
       buf[idx] = (buf[idx] * 7) ~/ 10;
@@ -404,7 +439,7 @@ void _strokeRect(
   }
   // 右辺
   final int rx = right - 1;
-  if (rx >= 0 && rx < ts && rx != left) {
+  if (drawRight && rx >= 0 && rx < ts && rx != left) {
     for (int y = top; y < bottom; y++) {
       final int idx = (y * ts + rx) * 4;
       buf[idx] = (buf[idx] * 7) ~/ 10;
@@ -416,9 +451,18 @@ void _strokeRect(
 }
 
 /// 赤ハイライト用: 不透明色の枠線を [thickness] px 分書く。
+///
+/// 同様に tile にクランプされた辺には枠を描かない。
 void _strokeRectColor(
     Uint8List buf, int ts, int left, int top, int right, int bottom,
-    {required int r, required int g, required int b, required int thickness}) {
+    {required int r,
+    required int g,
+    required int b,
+    required int thickness,
+    required bool drawTop,
+    required bool drawBottom,
+    required bool drawLeft,
+    required bool drawRight}) {
   for (int t = 0; t < thickness; t++) {
     final int l = left + t;
     final int rr = right - 1 - t;
@@ -427,14 +471,14 @@ void _strokeRectColor(
     if (l >= rr || tt >= bb) break;
     // 上下
     for (int x = l; x <= rr; x++) {
-      if (tt >= 0 && tt < ts && x >= 0 && x < ts) {
+      if (drawTop && tt >= 0 && tt < ts && x >= 0 && x < ts) {
         final int idx = (tt * ts + x) * 4;
         buf[idx] = r;
         buf[idx + 1] = g;
         buf[idx + 2] = b;
         buf[idx + 3] = 255;
       }
-      if (bb >= 0 && bb < ts && x >= 0 && x < ts) {
+      if (drawBottom && bb >= 0 && bb < ts && x >= 0 && x < ts) {
         final int idx = (bb * ts + x) * 4;
         buf[idx] = r;
         buf[idx + 1] = g;
@@ -444,14 +488,14 @@ void _strokeRectColor(
     }
     // 左右
     for (int y = tt; y <= bb; y++) {
-      if (l >= 0 && l < ts && y >= 0 && y < ts) {
+      if (drawLeft && l >= 0 && l < ts && y >= 0 && y < ts) {
         final int idx = (y * ts + l) * 4;
         buf[idx] = r;
         buf[idx + 1] = g;
         buf[idx + 2] = b;
         buf[idx + 3] = 255;
       }
-      if (rr >= 0 && rr < ts && y >= 0 && y < ts) {
+      if (drawRight && rr >= 0 && rr < ts && y >= 0 && y < ts) {
         final int idx = (y * ts + rr) * 4;
         buf[idx] = r;
         buf[idx + 1] = g;

@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'map/map_widget_adaptive.dart';
 import 'common/menu_drawer.dart';
+import 'common/background_activity_pill.dart';
 import '../../viewmodels/import_export_view_model.dart';
 
 class HomeScreen extends StatelessWidget {
@@ -14,6 +15,8 @@ class HomeScreen extends StatelessWidget {
       body: Stack(
         children: [
           const MapWidgetAdaptive(),
+          // 背景処理の存在を示す画面上部のピル。操作はブロックしない。
+          const BackgroundActivityPill(),
           // ローディングインジケータ
           Consumer<ImportExportViewModel>(
             builder: (context, vm, child) {
