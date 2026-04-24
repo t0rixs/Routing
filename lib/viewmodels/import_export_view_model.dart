@@ -37,6 +37,8 @@ class ImportExportViewModel extends ChangeNotifier {
       final dbPath = await appDatabasesPath();
 
       // 既存の DB 接続を閉じてキャッシュを無効化（古い inode を掴み続けるのを防ぐ）
+      // 同時に書き込みを停止する（pauseWrites）。in-flight な GPS 記録 future が
+      // 新しい DB ファイルを勝手に再生成するのを防ぐ。
       await _databaseRepository.closeAll();
 
       // インポート処理 (FileRepository内で自動リネームが走る)
@@ -45,7 +47,7 @@ class ImportExportViewModel extends ChangeNotifier {
 
       _successMessage = 'Import successful!';
 
-      // DBリポジトリに再スキャンを依頼
+      // DBリポジトリに再スキャンを依頼（末尾で resumeWrites も呼ばれる）
       await _databaseRepository.scanExistingDatabases();
 
       notifyListeners();
@@ -53,6 +55,8 @@ class ImportExportViewModel extends ChangeNotifier {
       _errorMessage = 'Import failed: $e';
       debugPrint(_errorMessage);
       notifyListeners();
+      // 例外時も書き込みを再開しないと以後ずっと no-op になってしまう。
+      _databaseRepository.resumeWrites();
     } finally {
       _setLoading(false);
     }
@@ -65,7 +69,7 @@ class ImportExportViewModel extends ChangeNotifier {
     _resetProgress();
 
     try {
-      // 全てのDB接続を閉じて、WAL等をマージ・フラッシュさせる
+      // 全てのDB接続を閉じて、WAL等をマージ・フラッシュさせる（pauseWrites も発動）
       await _databaseRepository.closeAll();
 
       final dbPath = await appDatabasesPath();
@@ -78,6 +82,8 @@ class ImportExportViewModel extends ChangeNotifier {
       debugPrint(_errorMessage);
       notifyListeners();
     } finally {
+      // export では DB ファイル差し替えは無いので即座に再開して問題なし。
+      _databaseRepository.resumeWrites();
       _setLoading(false);
     }
   }

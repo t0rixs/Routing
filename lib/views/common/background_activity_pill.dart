@@ -2,10 +2,10 @@ import 'package:flutter/material.dart';
 
 import '../../services/background_activity_service.dart';
 
-/// 画面上部に表示される「処理中」ピル。
+/// 画面上部に表示される「処理中」インジケータ。
 /// - 操作をブロックしない (IgnorePointer でタップを透過)
 /// - `BackgroundActivityService.isActive` が true の間だけフェードイン
-/// - ピル自体のレンダリングは極めて軽量なので、処理がある限り常時表示する
+/// - 文字は出さず右上に小さなスピナーのみ（セル数 HUD とかぶらないため）
 class BackgroundActivityPill extends StatelessWidget {
   const BackgroundActivityPill({super.key});
 
@@ -14,9 +14,9 @@ class BackgroundActivityPill extends StatelessWidget {
     return IgnorePointer(
       child: SafeArea(
         child: Align(
-          alignment: Alignment.topCenter,
+          alignment: Alignment.topRight,
           child: Padding(
-            padding: const EdgeInsets.only(top: 8),
+            padding: const EdgeInsets.only(top: 8, right: 12),
             child: AnimatedBuilder(
               animation: BackgroundActivityService.instance,
               builder: (context, _) {
@@ -45,30 +45,16 @@ class _PillChip extends StatelessWidget {
     return Material(
       elevation: 2,
       borderRadius: BorderRadius.circular(20),
-      color: Colors.black.withValues(alpha: 0.72),
+      color: Colors.black.withValues(alpha: 0.55),
       child: const Padding(
-        padding: EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            SizedBox(
-              width: 12,
-              height: 12,
-              child: CircularProgressIndicator(
-                strokeWidth: 2,
-                valueColor: AlwaysStoppedAnimation(Colors.white),
-              ),
-            ),
-            SizedBox(width: 8),
-            Text(
-              '処理中',
-              style: TextStyle(
-                color: Colors.white,
-                fontSize: 12,
-                fontWeight: FontWeight.w500,
-              ),
-            ),
-          ],
+        padding: EdgeInsets.all(8),
+        child: SizedBox(
+          width: 14,
+          height: 14,
+          child: CircularProgressIndicator(
+            strokeWidth: 2,
+            valueColor: AlwaysStoppedAnimation(Colors.white),
+          ),
         ),
       ),
     );

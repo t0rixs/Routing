@@ -32,6 +32,9 @@ class _MapWidgetFlutterMapState extends State<MapWidgetFlutterMap> {
   int _lastManualZ = -1;
   int _lastTileRefreshCounter = -1;
 
+  /// 起動時に SharedPreferences からのカメラ位置ロードを待つ Future。
+  Future<gmap.CameraPosition>? _initialCameraFuture;
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
@@ -41,6 +44,7 @@ class _MapWidgetFlutterMapState extends State<MapWidgetFlutterMap> {
       _lastManualZ = _mapViewModel!.manualCellZ;
       _lastTileRefreshCounter = _mapViewModel!.tileRefreshCounter;
       _mapViewModel!.addListener(_onViewModelChanged);
+      _initialCameraFuture = _mapViewModel!.initializeCameraPosition();
     }
   }
 
@@ -130,10 +134,18 @@ class _MapWidgetFlutterMapState extends State<MapWidgetFlutterMap> {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<MapViewModel>(
-      builder: (context, viewModel, child) {
-        final initial = viewModel.cameraPosition;
-        return Stack(
+    return FutureBuilder<gmap.CameraPosition>(
+      future: _initialCameraFuture,
+      builder: (context, snapshot) {
+        if (!snapshot.hasData) {
+          // 復元処理中は無地で隠す。スピナーは出さず、準備完了後に自然に
+          // マップが現れるようにする。
+          return const ColoredBox(color: Colors.white);
+        }
+        final initial = snapshot.data!;
+        return Consumer<MapViewModel>(
+          builder: (context, viewModel, child) {
+            return Stack(
           children: [
             FlutterMap(
               mapController: _mapController,
@@ -253,6 +265,8 @@ class _MapWidgetFlutterMapState extends State<MapWidgetFlutterMap> {
               child: CellSizeControl(),
             ),
           ],
+        );
+          },
         );
       },
     );

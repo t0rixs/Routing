@@ -3,10 +3,13 @@ import 'package:provider/provider.dart';
 
 import '../../viewmodels/map_view_model.dart';
 
-/// セル描画サイズの固定/解除を切り替えるトグルボタン。
+/// セル描画サイズの固定 / 解除を切り替えるトグルボタン。
 ///
-/// - 自動モード時: 「固定」アイコン。押すと現在の自動 cellZ（map zoom）で固定
-/// - 手動（固定）モード時: 「固定解除」アイコン＋現在の Z 値。押すと自動に戻る
+/// - 自動モード時  : 白背景＋青アイコン（lock_open）。押すと現在の cellZ で固定。
+/// - 手動（固定）時: 青背景＋白文字（"Z{n}"）。押すと自動に戻す。
+///
+/// ロック中でもボタンサイズを大きくしないよう、両方とも `mini` FAB を使い、
+/// 数字は `Text` で表示する（アイコンは不要）。
 class CellSizeControl extends StatelessWidget {
   const CellSizeControl({super.key});
 
@@ -14,33 +17,39 @@ class CellSizeControl extends StatelessWidget {
   Widget build(BuildContext context) {
     return Consumer<MapViewModel>(
       builder: (context, viewModel, _) {
-        if (viewModel.isManualCellSize) {
-          return _buildLockedButton(context, viewModel);
-        }
-        return _buildUnlockedButton(context, viewModel);
+        final bool locked = viewModel.isManualCellSize;
+        final cs = Theme.of(context).colorScheme;
+        return FloatingActionButton(
+          heroTag: 'cellSizeToggle',
+          mini: true,
+          backgroundColor: locked ? cs.primary : cs.surface,
+          foregroundColor: locked ? cs.onPrimary : cs.primary,
+          tooltip: locked
+              ? 'Z${viewModel.manualCellZ}（タップで自動に戻す）'
+              : '現在の拡大率でセルサイズを固定',
+          onPressed: () {
+            if (locked) {
+              viewModel.setAutoCellSize();
+            } else {
+              // 自動モードのタイル/プリフェッチ計算は `zoom.floor()` を使うため、
+              // 固定時も同じ floor 値を採用しないとロック前後でセルサイズが
+              // 1 段ぶん変わって見える（ズーム 13.7 → round で 14、floor で 13）。
+              final currentZ =
+                  viewModel.cameraPosition.zoom.floor().clamp(3, 14);
+              viewModel.setManualCellSize(currentZ);
+            }
+          },
+          child: locked
+              ? Text(
+                  'Z${viewModel.manualCellZ}',
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  ),
+                )
+              : const Icon(Icons.lock_open, size: 20),
+        );
       },
-    );
-  }
-
-  Widget _buildUnlockedButton(BuildContext context, MapViewModel viewModel) {
-    return FloatingActionButton.small(
-      heroTag: 'cellSizeToggle',
-      tooltip: '現在の拡大率でセルサイズを固定',
-      onPressed: () {
-        final currentZ = viewModel.cameraPosition.zoom.round().clamp(3, 14);
-        viewModel.setManualCellSize(currentZ);
-      },
-      child: const Icon(Icons.lock_open),
-    );
-  }
-
-  Widget _buildLockedButton(BuildContext context, MapViewModel viewModel) {
-    return FloatingActionButton.extended(
-      heroTag: 'cellSizeToggle',
-      tooltip: '自動モードに戻す',
-      onPressed: () => viewModel.setAutoCellSize(),
-      icon: const Icon(Icons.lock),
-      label: Text('Z${viewModel.manualCellZ}'),
     );
   }
 }

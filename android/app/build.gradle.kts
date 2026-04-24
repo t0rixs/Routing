@@ -24,7 +24,7 @@ val MAPS_API_KEY: String = run {
 }
 
 android {
-    namespace = "com.mapping.routing"
+    namespace = "com.lizdev.routepia"
     compileSdk = flutter.compileSdkVersion
     ndkVersion = flutter.ndkVersion
 
@@ -54,7 +54,7 @@ android {
 
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
-        applicationId = "com.mapping.routing"
+        applicationId = "com.lizdev.routepia"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
         minSdk = flutter.minSdkVersion
@@ -71,6 +71,12 @@ android {
             signingConfig = signingConfigs.getByName("release")
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            ndk {
+                // ネイティブ .so のデバッグシンボルを AAB から剥がし、
+                // Play Console 用に native-debug-symbols.zip として別途出力する。
+                // "SYMBOL_TABLE" でも Play Console のクラッシュ解析には十分。
+                debugSymbolLevel = "SYMBOL_TABLE"
+            }
         }
     }
 }

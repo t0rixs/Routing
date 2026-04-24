@@ -4,6 +4,8 @@ import 'package:file_picker/file_picker.dart';
 import '../../repositories/database_repository.dart';
 import '../../viewmodels/import_export_view_model.dart';
 import '../../viewmodels/map_view_model.dart';
+import '../../viewmodels/theme_controller.dart';
+import 'map_style_settings_screen.dart';
 
 class MenuDrawer extends StatelessWidget {
   const MenuDrawer({super.key});
@@ -13,7 +15,9 @@ class MenuDrawer extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final bool isDark = Theme.of(context).brightness == Brightness.dark;
     return Drawer(
+      backgroundColor: isDark ? Colors.black : null,
       child: ListView(
         padding: EdgeInsets.zero,
         children: [
@@ -22,6 +26,31 @@ class MenuDrawer extends StatelessWidget {
             child: Text('Routing Menu',
                 style: TextStyle(color: Colors.white, fontSize: 24)),
           ),
+          // 位置情報記録の ON/OFF スイッチ。
+          // OFF にすると GPS 購読を止め、foreground service 通知も消える。
+          // 状態は SharedPreferences に永続化される。
+          Consumer<MapViewModel>(
+            builder: (context, vm, _) {
+              final on = vm.recordingEnabled;
+              return SwitchListTile(
+                secondary: Icon(
+                  on ? Icons.fiber_manual_record : Icons.stop_circle_outlined,
+                  color: on ? Colors.red : null,
+                ),
+                title: const Text('位置情報を記録'),
+                subtitle: Text(on ? '記録中（タップで停止）' : '停止中（タップで再開）'),
+                value: on,
+                onChanged: (v) async {
+                  if (v) {
+                    await vm.startRecording();
+                  } else {
+                    await vm.stopRecording();
+                  }
+                },
+              );
+            },
+          ),
+          const Divider(height: 0),
           ListTile(
             leading: const Icon(Icons.file_upload),
             title: const Text('Import .mapping'),
@@ -98,6 +127,9 @@ class MenuDrawer extends StatelessWidget {
                   // GPS 再開 + TileOverlay 再生成（新しい DB から描画が組み立てられる）
                   await mapVm.setBusy(false);
                   mapVm.refreshMap();
+                  // HUD の {unique}/{visits} をインポート後の DB から再計算し、
+                  // SharedPreferences キャッシュも更新する。
+                  mapVm.refreshTotalStats(immediate: true);
                 }
                 _isImporting = false;
               }
@@ -106,7 +138,6 @@ class MenuDrawer extends StatelessWidget {
           ListTile(
             leading: const Icon(Icons.file_download),
             title: const Text('Export .mapping'),
-            subtitle: const Text('Android・iOS両対応'),
             onTap: () async {
               Navigator.pop(context); // Close drawer
 
@@ -161,6 +192,124 @@ class MenuDrawer extends StatelessWidget {
               );
             },
           ),
+          // アプリ全体のダークモード（UI テーマ＋ベースマップ）を一括切替。
+          // ThemeController（UI テーマ）と MapBaseStyle（マップ地図タイル）の
+          // 両方を同時に更新し、SharedPreferences へ個別に永続化する。
+          Consumer2<ThemeController, MapViewModel>(
+            builder: (context, themeCtrl, vm, _) {
+              final bool isDark = themeCtrl.themeMode == ThemeMode.dark;
+              return SwitchListTile(
+                secondary: Icon(
+                  isDark ? Icons.dark_mode : Icons.light_mode,
+                ),
+                title: const Text('ダークモード'),
+                subtitle: Text(isDark ? 'ダーク（UI＋マップ）' : 'ライト（UI＋マップ）'),
+                value: isDark,
+                onChanged: (v) {
+                  themeCtrl.setThemeMode(v ? ThemeMode.dark : ThemeMode.light);
+                  vm.setMapBaseStyle(
+                    v ? MapBaseStyle.dark : MapBaseStyle.standard,
+                  );
+                },
+              );
+            },
+          ),
+          // マップ表示の詳細設定（別画面へ遷移）
+          ListTile(
+            leading: const Icon(Icons.tune),
+            title: const Text('マップ表示の詳細設定'),
+            subtitle: const Text('ランドマーク・駅・路線などを個別に切替'),
+            onTap: () {
+              Navigator.pop(context); // drawer を閉じる
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const MapStyleSettingsScreen(),
+                ),
+              );
+            },
+          ),
+          const Divider(),
+          // z=14 → z=3..13 の親ズームデータを再構築する。
+          // 旧バージョンで z=14 しか記録していなかった DB を修復するため。
+          ListTile(
+            leading: const Icon(Icons.layers),
+            title: const Text('低ズーム描画を再構築'),
+            subtitle: const Text('z=14 の記録から z=3..13 を作り直します'),
+            onTap: () async {
+              final mapVm =
+                  Provider.of<MapViewModel>(context, listen: false);
+              final messenger = ScaffoldMessenger.of(context);
+              final navigator = Navigator.of(context);
+
+              final confirmed = await showDialog<bool>(
+                context: context,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('低ズーム描画を再構築'),
+                  content: const Text(
+                      'z=3..13 のデータを z=14 から作り直します。記録データ（z=14）は変更されません。\n'
+                      '完了まで数十秒〜数分かかる場合があります。'),
+                  actions: [
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(false),
+                      child: const Text('キャンセル'),
+                    ),
+                    TextButton(
+                      onPressed: () => Navigator.of(ctx).pop(true),
+                      child: const Text('実行'),
+                    ),
+                  ],
+                ),
+              );
+              if (confirmed != true) return;
+
+              navigator.pop(); // close drawer
+
+              // 進捗ダイアログ
+              final progress = ValueNotifier<(int, int)>((0, 0));
+              // ignore: unawaited_futures, use_build_context_synchronously
+              showDialog<void>(
+                context: navigator.context,
+                barrierDismissible: false,
+                builder: (ctx) => AlertDialog(
+                  title: const Text('再構築中...'),
+                  content: ValueListenableBuilder<(int, int)>(
+                    valueListenable: progress,
+                    builder: (_, v, __) {
+                      final (p, t) = v;
+                      final double? frac =
+                          t > 0 ? (p / t).clamp(0.0, 1.0) : null;
+                      return Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          LinearProgressIndicator(value: frac),
+                          const SizedBox(height: 12),
+                          Text(t > 0
+                              ? '$p / $t shards'
+                              : 'z=14 shard を走査中...'),
+                        ],
+                      );
+                    },
+                  ),
+                ),
+              );
+
+              try {
+                await mapVm.rebuildParentZooms(
+                  onProgress: (p, t) => progress.value = (p, t),
+                );
+                if (navigator.canPop()) navigator.pop(); // close progress
+                messenger.showSnackBar(const SnackBar(
+                    content: Text('低ズーム描画の再構築が完了しました')));
+              } catch (e) {
+                if (navigator.canPop()) navigator.pop();
+                messenger.showSnackBar(SnackBar(
+                    content: Text('再構築に失敗: $e'),
+                    backgroundColor: Colors.red));
+              } finally {
+                progress.dispose();
+              }
+            },
+          ),
           const Divider(),
           ListTile(
             leading: const Icon(Icons.delete_forever, color: Colors.red),
@@ -213,6 +362,8 @@ class MenuDrawer extends StatelessWidget {
               } finally {
                 await mapVm.setBusy(false);
                 mapVm.refreshMap();
+                // HUD の {unique}/{visits} を 0/0 に即時反映し、キャッシュも更新。
+                mapVm.refreshTotalStats(immediate: true);
               }
             },
           ),

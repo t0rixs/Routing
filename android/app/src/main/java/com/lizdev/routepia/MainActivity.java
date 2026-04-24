@@ -1,4 +1,4 @@
-package com.mapping.routing;
+package com.lizdev.routepia;
 
 import io.flutter.embedding.android.FlutterActivity;
 

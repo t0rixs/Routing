@@ -295,12 +295,12 @@ Uint8List _rasterizeTile(_RasterizeRequest req) {
     if (iBottom > ts) iBottom = ts;
     if (iRight <= iLeft || iBottom <= iTop) continue;
 
-    // 色計算: HSV(255→0, 1, 0.8) を val の割合で。main の
+    // 色計算: HSV(255→0, 1, 1.0) を val の割合で。main の
     // `_calculateCellColor` と同一式を使う (色味を揃えるため)。
     final double ratio =
         val.clamp(1, safeMax).toDouble() / safeMax.toDouble();
     final double hue = 255.0 - ratio * 255.0;
-    final _Rgb rgb = _hsvToRgb(hue, 1.0, 0.8);
+    final _Rgb rgb = _hsvToRgb(hue, 1.0, 1.0);
 
     // 塗りつぶし。行ごとに先頭 offset を計算し、4 バイト単位で書く。
     // Uint8List 直書きは setPixel 系より桁違いに速い。

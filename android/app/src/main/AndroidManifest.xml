@@ -8,15 +8,19 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION"/>
+    <uses-permission android:name="com.google.android.gms.permission.AD_ID"/>
     
     
     <application
-        android:label="routing"
+        android:label="Routepia"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher"
         android:requestLegacyExternalStorage="true">
         <meta-data android:name="com.google.android.geo.API_KEY"
             android:value="${MAPS_API_KEY}"/>
+        <meta-data
+            android:name="com.google.android.gms.ads.APPLICATION_ID"
+            android:value="ca-app-pub-7385231614068137~6958449763"/>
         <activity
             android:name=".MainActivity"
             android:exported="true"
