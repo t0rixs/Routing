@@ -7,6 +7,7 @@ import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:provider/provider.dart';
 
+import '../../generated/l10n/app_localizations.dart';
 import '../../models/cell.dart';
 import '../../viewmodels/map_view_model.dart';
 import 'cell_size_control.dart';
@@ -162,40 +163,48 @@ class _MapWidgetFlutterMapState extends State<MapWidgetFlutterMap> {
                   if (!context.mounted || cell == null) return;
                   await showDialog(
                     context: context,
-                    builder: (ctx) => AlertDialog(
-                      title: const Text('Cell Info'),
-                      content: Column(
-                        mainAxisSize: MainAxisSize.min,
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text('Value: ${cell.val}'),
-                          Text('Lat Index: ${cell.lat}'),
-                          Text('Lng Index: ${cell.lng}'),
-                          if (cell.p1 != null && cell.p1! > 0)
-                            Text(
-                                '初回更新: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.p1!))}'),
-                          Text(
-                              '最終更新時間: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.tm))}'),
-                          GestureDetector(
-                            onTap: () {
-                              Navigator.of(ctx).pop();
-                              viewModel.startDeleteSectionMode(cell);
-                            },
-                            child: const Padding(
-                              padding: EdgeInsets.only(top: 8.0),
-                              child: Text('区間削除',
-                                  style: TextStyle(color: Colors.blue)),
+                    builder: (ctx) {
+                      final l = AppLocalizations.of(ctx)!;
+                      return AlertDialog(
+                        title: const Text('Cell Info'),
+                        content: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('Value: ${cell.val}'),
+                            Text('Lat Index: ${cell.lat}'),
+                            Text('Lng Index: ${cell.lng}'),
+                            if (cell.p1 != null && cell.p1! > 0)
+                              Text(l.cellInfoFirst(
+                                  DateFormat('yyyy/MM/dd HH:mm').format(
+                                      DateTime.fromMillisecondsSinceEpoch(
+                                          cell.p1!)))),
+                            Text(l.cellInfoLast(
+                                DateFormat('yyyy/MM/dd HH:mm').format(
+                                    DateTime.fromMillisecondsSinceEpoch(
+                                        cell.tm)))),
+                            GestureDetector(
+                              onTap: () {
+                                Navigator.of(ctx).pop();
+                                viewModel.startDeleteSectionMode(cell);
+                              },
+                              child: Padding(
+                                padding: const EdgeInsets.only(top: 8.0),
+                                child: Text(l.deleteSection,
+                                    style:
+                                        const TextStyle(color: Colors.blue)),
+                              ),
                             ),
+                          ],
+                        ),
+                        actions: [
+                          TextButton(
+                            child: Text(l.ok),
+                            onPressed: () => Navigator.of(ctx).pop(),
                           ),
                         ],
-                      ),
-                      actions: [
-                        TextButton(
-                          child: const Text('Close'),
-                          onPressed: () => Navigator.of(ctx).pop(),
-                        ),
-                      ],
-                    ),
+                      );
+                    },
                   );
                 },
                 onMapReady: () {

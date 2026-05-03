@@ -1,7 +1,8 @@
 import 'package:flutter/material.dart';
-import 'package:geolocator/geolocator.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:provider/provider.dart';
 
+import '../../generated/l10n/app_localizations.dart';
 import '../../viewmodels/map_view_model.dart';
 
 /// `MapViewModel.locationAlwaysRequired` を監視し、true になったら
@@ -36,29 +37,26 @@ class _LocationAlwaysPromptState extends State<LocationAlwaysPrompt> {
 
   Future<void> _showDialog(BuildContext context, MapViewModel vm) async {
     if (!context.mounted) return;
+    final l = AppLocalizations.of(context)!;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Text('位置情報を「常に許可」に設定してください'),
-        content: const Text(
-          'このアプリは、アプリを閉じている間も走行ルートを記録するために、'
-          '位置情報の「常に許可」が必要です。\n\n'
-          '設定画面の「位置情報」を開き、「常に」を選択してください。',
-        ),
+        title: Text(l.locationAlwaysTitle),
+        content: Text(l.locationAlwaysBody),
         actions: [
           TextButton(
             onPressed: () {
               Navigator.of(ctx).pop();
             },
-            child: const Text('あとで'),
+            child: Text(l.later),
           ),
           FilledButton(
             onPressed: () async {
               Navigator.of(ctx).pop();
-              await Geolocator.openAppSettings();
+              await openAppSettings();
             },
-            child: const Text('設定を開く'),
+            child: Text(l.openSettings),
           ),
         ],
       ),

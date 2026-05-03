@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../generated/l10n/app_localizations.dart';
 import '../../viewmodels/map_view_model.dart';
 import 'banner_ad_widget.dart';
 
@@ -13,18 +14,19 @@ class MapStyleSettingsScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('マップ表示の詳細設定'),
+        title: Text(l.mapSettingsTitle),
         actions: [
           Consumer<MapViewModel>(
             builder: (context, vm, _) {
               return TextButton(
                 onPressed: () =>
                     vm.setStyleOverrides(const MapStyleOverrides()),
-                child: const Text(
-                  'リセット',
-                  style: TextStyle(color: Colors.white),
+                child: Text(
+                  l.mapSettingsReset,
+                  style: const TextStyle(color: Colors.white),
                 ),
               );
             },
@@ -36,91 +38,91 @@ class MapStyleSettingsScreen extends StatelessWidget {
           final o = vm.styleOverrides;
           return ListView(
             children: [
-              _SectionHeader(title: 'ランドマーク（POI）'),
+              _SectionHeader(title: l.mapSectionPoi),
               _SwitchTile(
-                title: '店舗・商業施設',
+                title: l.poiBusiness,
                 value: o.showPoiBusiness,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showPoiBusiness: v)),
               ),
               _SwitchTile(
-                title: '公園',
+                title: l.poiPark,
                 value: o.showPoiPark,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showPoiPark: v)),
               ),
               _SwitchTile(
-                title: '観光地',
+                title: l.poiAttraction,
                 value: o.showPoiAttraction,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showPoiAttraction: v)),
               ),
               _SwitchTile(
-                title: '官公庁',
+                title: l.poiGovernment,
                 value: o.showPoiGovernment,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showPoiGovernment: v)),
               ),
               _SwitchTile(
-                title: '病院・医療',
+                title: l.poiMedical,
                 value: o.showPoiMedical,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showPoiMedical: v)),
               ),
               _SwitchTile(
-                title: '学校',
+                title: l.poiSchool,
                 value: o.showPoiSchool,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showPoiSchool: v)),
               ),
               _SwitchTile(
-                title: '宗教施設',
+                title: l.poiPlaceOfWorship,
                 value: o.showPoiPlaceOfWorship,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showPoiPlaceOfWorship: v)),
               ),
               _SwitchTile(
-                title: '運動施設',
+                title: l.poiSportsComplex,
                 value: o.showPoiSportsComplex,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showPoiSportsComplex: v)),
               ),
               const Divider(),
-              _SectionHeader(title: '交通機関'),
+              _SectionHeader(title: l.mapSectionTransit),
               _SwitchTile(
-                title: '路線（鉄道・バス等の線）',
+                title: l.transitLine,
                 value: o.showTransitLine,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showTransitLine: v)),
               ),
               _SwitchTile(
-                title: '鉄道駅',
+                title: l.railwayStation,
                 value: o.showRailwayStation,
                 onChanged: (v) => vm.setStyleOverrides(
                     o.copyWith(showRailwayStation: v)),
               ),
               _SwitchTile(
-                title: 'バス停',
+                title: l.busStation,
                 value: o.showBusStation,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showBusStation: v)),
               ),
               _SwitchTile(
-                title: '空港',
+                title: l.airport,
                 value: o.showAirport,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showAirport: v)),
               ),
               const Divider(),
-              _SectionHeader(title: 'ラベル'),
+              _SectionHeader(title: l.mapSectionLabels),
               _SwitchTile(
-                title: '道路ラベル',
+                title: l.labelRoad,
                 value: o.showRoadLabels,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showRoadLabels: v)),
               ),
               _SwitchTile(
-                title: '地名・境界ラベル',
+                title: l.labelAdmin,
                 value: o.showAdminLabels,
                 onChanged: (v) =>
                     vm.setStyleOverrides(o.copyWith(showAdminLabels: v)),

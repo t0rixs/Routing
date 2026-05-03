@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../generated/l10n/app_localizations.dart';
 import '../../viewmodels/map_view_model.dart';
 
 /// セル描画サイズの固定 / 解除を切り替えるトグルボタン。
@@ -19,14 +20,15 @@ class CellSizeControl extends StatelessWidget {
       builder: (context, viewModel, _) {
         final bool locked = viewModel.isManualCellSize;
         final cs = Theme.of(context).colorScheme;
+        final l = AppLocalizations.of(context)!;
         return FloatingActionButton(
           heroTag: 'cellSizeToggle',
           mini: true,
           backgroundColor: locked ? cs.primary : cs.surface,
           foregroundColor: locked ? cs.onPrimary : cs.primary,
           tooltip: locked
-              ? 'Z${viewModel.manualCellZ}（タップで自動に戻す）'
-              : '現在の拡大率でセルサイズを固定',
+              ? l.cellSizeLockedTooltip(viewModel.manualCellZ)
+              : l.cellSizeFix,
           onPressed: () {
             if (locked) {
               viewModel.setAutoCellSize();

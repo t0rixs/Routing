@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:country_flags/country_flags.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:path/path.dart' as p;
@@ -7,6 +8,7 @@ import 'package:provider/provider.dart';
 import 'package:sqflite/sqflite.dart';
 
 import '../../data/world_areas.dart';
+import '../../generated/l10n/app_localizations.dart';
 import '../../repositories/database_repository.dart';
 import '../../viewmodels/map_view_model.dart';
 import 'banner_ad_widget.dart';
@@ -27,16 +29,17 @@ class StatsDetailScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    final l = AppLocalizations.of(context)!;
     return DefaultTabController(
       length: 2,
       child: Scaffold(
         backgroundColor: isDark ? Colors.black : null,
         appBar: AppBar(
-          title: const Text('累計データ'),
-          bottom: const TabBar(
+          title: Text(l.statsTitle),
+          bottom: TabBar(
             tabs: [
-              Tab(text: '達成度', icon: Icon(Icons.emoji_events)),
-              Tab(text: '履歴', icon: Icon(Icons.calendar_today)),
+              Tab(text: l.statsTabAchievement, icon: const Icon(Icons.emoji_events)),
+              Tab(text: l.statsTabHistory, icon: const Icon(Icons.calendar_today)),
             ],
           ),
         ),
@@ -97,26 +100,30 @@ class _AchievementTabState extends State<_AchievementTab> {
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
+    final String lang = Localizations.localeOf(context).languageCode;
     return Consumer<MapViewModel>(
       builder: (context, vm, _) {
         final int unique = vm.totalUniqueCells;
         final int totalM2 = unique * kCellAreaM2;
         final double totalKm2 = totalM2 / 1000000.0;
 
-        // 全エントリを (name, areaKm2, isUser, kind) の統一型で扱う。
-        // 面積降順でソートし、同点は `isUser` を先に出す（視覚的に自分を優先）。
+        // 全エントリを統一型で扱う。Locale で表示名を切替えると同時に
+        // regionScope によるフィルタも適用する。
         final rows = <_RankRow>[
-          for (final w in kWorldAreas)
+          for (final w in worldAreasFor(lang))
             _RankRow(
-              name: w.name,
+              name: w.displayName(lang),
               areaKm2: w.areaKm2,
               kind: w.kind,
+              iso2: w.iso2,
               isUser: false,
             ),
           _RankRow(
-            name: 'あなた',
+            name: l.you,
             areaKm2: totalKm2,
             kind: 'user',
+            iso2: null,
             isUser: true,
           ),
         ]..sort((a, b) {
@@ -155,11 +162,13 @@ class _RankRow {
     required this.name,
     required this.areaKm2,
     required this.kind,
+    required this.iso2,
     required this.isUser,
   });
   final String name;
   final double areaKm2;
   final String kind;
+  final String? iso2;
   final bool isUser;
 }
 
@@ -178,13 +187,14 @@ class _RankTile extends StatelessWidget {
     final f = NumberFormat.decimalPattern();
     final double progress =
         row.areaKm2 == 0 ? 1.0 : (userAreaKm2 / row.areaKm2);
+    final l = AppLocalizations.of(context)!;
     final bool isComplete = !row.isUser && progress >= 1.0;
     final double clampedProgress = progress.clamp(0.0, 1.0).toDouble();
     final String pctText = row.isUser
         ? ''
         : '${(progress * 100).toStringAsFixed(progress >= 1 ? 2 : 4)} %';
     final double m2 = row.areaKm2 * 1000000.0;
-    final String areaText = '${f.format(m2.round())} m2';
+    final String areaText = l.areaUnitM2(f.format(m2.round()));
 
     final bg = row.isUser
         ? Colors.green.withValues(alpha: 0.18)
@@ -219,11 +229,29 @@ class _RankTile extends StatelessWidget {
               ),
             ),
           ),
-          // アイコン
-          Icon(
-            row.isUser ? Icons.person_pin_circle : _iconFor(row.kind),
-            color: row.isUser ? Colors.green : Colors.grey[600],
-            size: 28,
+          // アイコン（country は国旗、その他は Material Icons）
+          SizedBox(
+            width: 32,
+            height: 28,
+            child: Center(
+              child: row.isUser
+                  ? const Icon(Icons.person_pin_circle,
+                      color: Colors.green, size: 28)
+                  : (row.kind == 'country' && row.iso2 != null
+                      ? ClipRRect(
+                          borderRadius: BorderRadius.circular(2),
+                          child: CountryFlag.fromCountryCode(
+                            row.iso2!,
+                            height: 18,
+                            width: 28,
+                          ),
+                        )
+                      : Icon(
+                          _iconFor(row.kind),
+                          color: Colors.grey[600],
+                          size: 28,
+                        )),
+            ),
           ),
           const SizedBox(width: 10),
           // 本体
@@ -271,9 +299,9 @@ class _RankTile extends StatelessWidget {
                   Row(
                     children: [
                       if (isComplete)
-                        const Text(
-                          'Complete.',
-                          style: TextStyle(
+                        Text(
+                          l.complete,
+                          style: const TextStyle(
                               color: Colors.red, fontSize: 12),
                         ),
                       const Spacer(),
@@ -450,12 +478,13 @@ class _HistoryTabState extends State<_HistoryTab> {
             return const Center(child: CircularProgressIndicator());
           }
           if (snap.hasError) {
+            final l = AppLocalizations.of(context)!;
             return ListView(
               children: [
                 const SizedBox(height: 80),
                 Center(
                   child: Text(
-                    '読み込み失敗: ${snap.error}',
+                    l.statsLoadFailed(snap.error.toString()),
                     style: const TextStyle(color: Colors.red),
                   ),
                 ),
@@ -464,17 +493,17 @@ class _HistoryTabState extends State<_HistoryTab> {
           }
           final list = snap.data ?? const <_HistoryEntry>[];
           if (list.isEmpty) {
+            final l = AppLocalizations.of(context)!;
             return ListView(
-              children: const [
-                SizedBox(height: 80),
+              children: [
+                const SizedBox(height: 80),
                 Center(
                   child: Padding(
-                    padding: EdgeInsets.symmetric(horizontal: 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 32),
                     child: Text(
-                      'まだ履歴がありません。\n'
-                      '.mapping ファイルをインポートするか、移動を記録すると履歴が蓄積されます。',
+                      l.statsHistoryEmpty,
                       textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.grey),
+                      style: const TextStyle(color: Colors.grey),
                     ),
                   ),
                 ),
@@ -509,7 +538,8 @@ class _HistoryTabState extends State<_HistoryTab> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-            content: Text('保存失敗: $e'), backgroundColor: Colors.red),
+            content: Text(AppLocalizations.of(context)!.saveFailed(e.toString())),
+            backgroundColor: Colors.red),
       );
     }
   }
@@ -543,6 +573,7 @@ class _TitleEditDialogState extends State<_TitleEditDialog> {
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
     return AlertDialog(
       title: Text(
         DateFormat('yyyy/MM/dd (E)').format(widget.entry.dateTime),
@@ -551,24 +582,24 @@ class _TitleEditDialogState extends State<_TitleEditDialog> {
         controller: _controller,
         autofocus: true,
         maxLength: 16,
-        decoration: const InputDecoration(
-          labelText: 'タイトル',
-          hintText: '最大 16 文字',
-          border: OutlineInputBorder(),
+        decoration: InputDecoration(
+          labelText: l.statsTitleLabel,
+          hintText: l.statsTitleHint,
+          border: const OutlineInputBorder(),
         ),
       ),
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(null),
-          child: const Text('キャンセル'),
+          child: Text(l.cancel),
         ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(''),
-          child: const Text('削除', style: TextStyle(color: Colors.red)),
+          child: Text(l.delete, style: const TextStyle(color: Colors.red)),
         ),
         TextButton(
           onPressed: () => Navigator.of(context).pop(_controller.text),
-          child: const Text('保存'),
+          child: Text(l.save),
         ),
       ],
     );
@@ -618,26 +649,29 @@ class _HistoryTile extends StatelessWidget {
                 ],
               ),
               const SizedBox(height: 6),
-              Row(
-                children: [
-                  _MiniMetric(
-                    label: '新規',
-                    value: f.format(entry.cell1),
-                    color: Colors.blue,
-                  ),
-                  const SizedBox(width: 16),
-                  _MiniMetric(
-                    label: '既存',
-                    value: f.format(entry.cell2),
-                    color: Colors.grey,
-                  ),
-                  const Spacer(),
-                  Text(
-                    '${f.format((entry.area1 + entry.area2).toInt())} m2',
-                    style: TextStyle(color: Colors.grey[600], fontSize: 11),
-                  ),
-                ],
-              ),
+              Builder(builder: (context) {
+                final l = AppLocalizations.of(context)!;
+                return Row(
+                  children: [
+                    _MiniMetric(
+                      label: l.statsCellNew,
+                      value: f.format(entry.cell1),
+                      color: Colors.blue,
+                    ),
+                    const SizedBox(width: 16),
+                    _MiniMetric(
+                      label: l.statsCellExisting,
+                      value: f.format(entry.cell2),
+                      color: Colors.grey,
+                    ),
+                    const Spacer(),
+                    Text(
+                      l.areaUnitM2(f.format((entry.area1 + entry.area2).toInt())),
+                      style: TextStyle(color: Colors.grey[600], fontSize: 11),
+                    ),
+                  ],
+                );
+              }),
             ],
           ),
         ),

@@ -145,18 +145,81 @@ class DatabaseRepository {
         onCreate: readOnly
             ? null
             : (db, version) async {
+                // 本家アプリ (MyAllTracks) のスキーマと完全互換にする。
+                // p2/p3/p4 を省略すると本家側で「カラム不足」となり、
+                // インポートしたデータが読めない / 描画されないバグが発生する。
+                // INDEX 名も本家と一致させる (`latlng on heatmap_table(tm)`)。
                 await db.execute(
-                    'CREATE TABLE IF NOT EXISTS heatmap_table (lat INTEGER, lng INTEGER, val INTEGER, tm INTEGER, p1 INTEGER, PRIMARY KEY (lat, lng))');
+                    'CREATE TABLE IF NOT EXISTS heatmap_table (lat integer, lng integer, val integer, tm integer, p1 integer, p2 integer, p3 integer, p4 integer, primary key(lat,lng))');
                 await db.execute(
-                    'CREATE INDEX IF NOT EXISTS idx_lat_lng ON heatmap_table (lat, lng)');
+                    'CREATE INDEX IF NOT EXISTS latlng ON heatmap_table(tm)');
+                // android_metadata は本家アプリが locale 判定で参照する場合があるため作成しておく。
+                await db.execute(
+                    'CREATE TABLE IF NOT EXISTS android_metadata (locale TEXT)');
               },
       );
+      // 既存 DB に本家互換スキーマが揃っていない場合に追加マイグレーション。
+      // 旧バージョンのアプリで作成された DB は p2/p3/p4 が無く、index 名も
+      // 異なるため、本家アプリへエクスポート後にデータが読み込めなくなる。
+      if (!readOnly) {
+        await _ensureLegacyCompatibleSchema(db);
+      }
       _openDatabases[key] = db;
       _openDbModes[key] = readOnly;
       return db;
     } catch (e) {
       debugPrint('Error opening database $key: $e');
       return null;
+    }
+  }
+
+  /// 既存 heatmap_table を本家アプリ (MyAllTracks) と完全互換のスキーマに揃える。
+  /// - p2 / p3 / p4 カラムを欠いていれば ALTER TABLE で追加
+  /// - 旧名 `idx_lat_lng` を削除し、`latlng on heatmap_table(tm)` を作成
+  /// - `android_metadata` テーブルが無ければ作成
+  ///
+  /// SQLite の ALTER TABLE ADD COLUMN は同名再追加でエラーを投げるため、
+  /// PRAGMA table_info で existing カラム集合を取得してから差分のみ追加する。
+  static Future<void> _ensureLegacyCompatibleSchema(Database db) async {
+    try {
+      // table が無いならスキップ（_openDB で onCreate が走らないケース対策）。
+      final tables = await db.rawQuery(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name='heatmap_table'");
+      if (tables.isEmpty) return;
+
+      final cols = await db.rawQuery('PRAGMA table_info(heatmap_table)');
+      final existing = <String>{
+        for (final r in cols) (r['name'] as String).toLowerCase(),
+      };
+      for (final missing in const ['p2', 'p3', 'p4']) {
+        if (!existing.contains(missing)) {
+          try {
+            await db
+                .execute('ALTER TABLE heatmap_table ADD COLUMN $missing integer');
+          } catch (e) {
+            debugPrint('ALTER TABLE add $missing failed: $e');
+          }
+        }
+      }
+
+      // 旧 index を落として本家命名に揃える。
+      try {
+        await db.execute('DROP INDEX IF EXISTS idx_lat_lng');
+      } catch (_) {}
+      try {
+        await db.execute(
+            'CREATE INDEX IF NOT EXISTS latlng ON heatmap_table(tm)');
+      } catch (e) {
+        debugPrint('CREATE INDEX latlng failed: $e');
+      }
+
+      // android_metadata は本家アプリが参照することがあるため作成しておく。
+      try {
+        await db.execute(
+            'CREATE TABLE IF NOT EXISTS android_metadata (locale TEXT)');
+      } catch (_) {}
+    } catch (e) {
+      debugPrint('_ensureLegacyCompatibleSchema failed: $e');
     }
   }
 
@@ -725,6 +788,10 @@ class DatabaseRepository {
             'val': delta,
             'tm': now,
             'p1': now,
+            // 本家アプリの heatmap_table スキーマには p2/p3/p4 が存在する。
+            // p2 は 0/1 のフラグ（観測上、新規セルは 0 がデフォルト）。
+            // p3/p4 は本家サンプルでは NULL のため、明示的に書かない。
+            'p2': 0,
           });
           newCount++;
         }

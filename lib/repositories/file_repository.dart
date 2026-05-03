@@ -480,6 +480,44 @@ class FileRepository {
                 modified = true;
               }
 
+              // 本家アプリ互換のため heatmap_table のスキーマを揃える。
+              // 旧バージョンで作成された DB は p2/p3/p4 が無く、本家アプリへ
+              // インポートすると z=14 以外で記録が描画されない不具合が発生する。
+              if (exportName.startsWith('hm_') && exportName.endsWith('.db')) {
+                final hmExists = Sqflite.firstIntValue(await db.rawQuery(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='heatmap_table'"));
+                if (hmExists != null && hmExists > 0) {
+                  final cols = await db
+                      .rawQuery('PRAGMA table_info(heatmap_table)');
+                  final existing = <String>{
+                    for (final r in cols)
+                      (r['name'] as String).toLowerCase(),
+                  };
+                  for (final missing in const ['p2', 'p3', 'p4']) {
+                    if (!existing.contains(missing)) {
+                      try {
+                        await db.execute(
+                            'ALTER TABLE heatmap_table ADD COLUMN $missing integer');
+                        modified = true;
+                      } catch (e) {
+                        debugPrint(
+                            'Export: ALTER TABLE add $missing failed on $exportName: $e');
+                      }
+                    }
+                  }
+                  // INDEX 名も本家命名に揃える。
+                  try {
+                    await db.execute('DROP INDEX IF EXISTS idx_lat_lng');
+                    await db.execute(
+                        'CREATE INDEX IF NOT EXISTS latlng ON heatmap_table(tm)');
+                    modified = true;
+                  } catch (e) {
+                    debugPrint(
+                        'Export: index rename failed on $exportName: $e');
+                  }
+                }
+              }
+
               await db.close();
             } catch (e) {
               // debugPrint('Failed to add metadata to $exportName: $e');

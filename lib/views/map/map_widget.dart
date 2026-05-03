@@ -3,6 +3,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:provider/provider.dart';
+import '../../generated/l10n/app_localizations.dart';
 import '../../viewmodels/map_view_model.dart';
 import 'package:intl/intl.dart';
 import 'cell_size_control.dart';
@@ -262,7 +263,7 @@ class _MapWidgetState extends State<MapWidget> {
                 mini: true,
                 backgroundColor: v.followUser ? cs.primary : cs.surface,
                 foregroundColor: v.followUser ? cs.onPrimary : cs.primary,
-                tooltip: v.followUser ? '追従中（タップで解除）' : '現在地に追従',
+                tooltip: v.followUser ? AppLocalizations.of(context)!.tooltipFollowingOn : AppLocalizations.of(context)!.tooltipFollowingOff,
                 onPressed: () {
                   v.toggleFollowUser();
                   final pos = v.lastKnownPosition;
@@ -292,7 +293,7 @@ class _MapWidgetState extends State<MapWidget> {
                 mini: true,
                 backgroundColor: cs.surface,
                 foregroundColor: cs.primary,
-                tooltip: '設定 / メニュー',
+                tooltip: AppLocalizations.of(context)!.tooltipMenu,
                 onPressed: () {
                   Scaffold.of(context).openDrawer();
                 },
@@ -313,19 +314,20 @@ class _MapWidgetState extends State<MapWidget> {
             builder: (context, currentStyle, _) {
               IconData icon;
               String tooltip;
+              final lTip = AppLocalizations.of(context)!;
               switch (currentStyle) {
                 case MapBaseStyle.satellite:
                   icon = Icons.satellite_alt;
-                  tooltip = '衛星マップ（タップで白紙に切替）';
+                  tooltip = lTip.tooltipMapSatellite;
                   break;
                 case MapBaseStyle.blank:
                   icon = Icons.crop_square;
-                  tooltip = '白紙マップ（タップで通常に切替）';
+                  tooltip = lTip.tooltipMapBlank;
                   break;
                 case MapBaseStyle.standard:
                 case MapBaseStyle.dark:
                   icon = Icons.map;
-                  tooltip = '通常マップ（タップで衛星に切替）';
+                  tooltip = lTip.tooltipMapStandard;
                   break;
               }
               final cs = Theme.of(context).colorScheme;
@@ -374,7 +376,7 @@ class _MapWidgetState extends State<MapWidget> {
                 mini: true,
                 backgroundColor: cs.surface,
                 foregroundColor: cs.primary,
-                tooltip: '北向き・水平に戻す',
+                tooltip: AppLocalizations.of(context)!.tooltipResetCamera,
                 onPressed: () {
                   final vm = context.read<MapViewModel>();
                   final cp = vm.cameraPosition;
@@ -422,7 +424,7 @@ class _MapWidgetState extends State<MapWidget> {
           builder: (context) {
             final cs = Theme.of(context).colorScheme;
             return Tooltip(
-          message: _fabExpanded ? '閉じる（長押しで達成度）' : 'メニュー（長押しで達成度）',
+          message: _fabExpanded ? AppLocalizations.of(context)!.fabClose : AppLocalizations.of(context)!.fabMenu,
           child: Material(
             color: cs.surface,
             elevation: 6,
@@ -472,39 +474,45 @@ class _MapWidgetState extends State<MapWidget> {
     if (!context.mounted || cell == null) return;
     showDialog(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Cell Info'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Value: ${cell.val}'),
-            Text('Lat Index: ${cell.lat}'),
-            Text('Lng Index: ${cell.lng}'),
-            if (cell.p1 != null && cell.p1! > 0)
-              Text(
-                  '初回更新: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.p1!))}'),
-            Text(
-                '最終更新時間: ${DateFormat('yyyy/MM/dd HH:mm').format(DateTime.fromMillisecondsSinceEpoch(cell.tm))}'),
-            GestureDetector(
-              onTap: () {
-                Navigator.of(ctx).pop();
-                viewModel.startDeleteSectionMode(cell);
-              },
-              child: const Padding(
-                padding: EdgeInsets.only(top: 8.0),
-                child: Text('区間削除', style: TextStyle(color: Colors.blue)),
+      builder: (ctx) {
+        final l = AppLocalizations.of(ctx)!;
+        return AlertDialog(
+          title: const Text('Cell Info'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('Value: ${cell.val}'),
+              Text('Lat Index: ${cell.lat}'),
+              Text('Lng Index: ${cell.lng}'),
+              if (cell.p1 != null && cell.p1! > 0)
+                Text(l.cellInfoFirst(
+                    DateFormat('yyyy/MM/dd HH:mm').format(
+                        DateTime.fromMillisecondsSinceEpoch(cell.p1!)))),
+              Text(l.cellInfoLast(
+                  DateFormat('yyyy/MM/dd HH:mm').format(
+                      DateTime.fromMillisecondsSinceEpoch(cell.tm)))),
+              GestureDetector(
+                onTap: () {
+                  Navigator.of(ctx).pop();
+                  viewModel.startDeleteSectionMode(cell);
+                },
+                child: Padding(
+                  padding: const EdgeInsets.only(top: 8.0),
+                  child: Text(l.deleteSection,
+                      style: const TextStyle(color: Colors.blue)),
+                ),
               ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              child: Text(l.ok),
+              onPressed: () => Navigator.of(ctx).pop(),
             ),
           ],
-        ),
-        actions: [
-          TextButton(
-            child: const Text('Close'),
-            onPressed: () => Navigator.of(ctx).pop(),
-          ),
-        ],
-      ),
+        );
+      },
     );
   }
 }
@@ -515,6 +523,7 @@ class _DeleteSectionOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final l = AppLocalizations.of(context)!;
     return Positioned(
       top: 50,
       left: 20,
@@ -527,7 +536,7 @@ class _DeleteSectionOverlay extends StatelessWidget {
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                viewModel.isDeleteReady ? '削除範囲が選択されました' : '区間の終点を選択してください',
+                viewModel.isDeleteReady ? l.deleteSelected : l.deleteSelectEnd,
                 style: const TextStyle(
                     fontSize: 16, fontWeight: FontWeight.bold),
               ),
@@ -538,21 +547,21 @@ class _DeleteSectionOverlay extends StatelessWidget {
                       backgroundColor: Colors.red,
                       foregroundColor: Colors.white),
                   child: Text(
-                      '削除実行 (${viewModel.highlightCells.length} cells)'),
+                      l.deleteExecuteCells(viewModel.highlightCells.length)),
                   onPressed: () {
                     showDialog(
                       context: context,
                       builder: (ctx) => AlertDialog(
-                        title: const Text('区間削除'),
-                        content: Text(
-                            '選択された範囲のデータを削除しますか？\nこの操作は取り消せません。\n対象セル数: ${viewModel.highlightCells.length}'),
+                        title: Text(l.deleteSectionConfirmTitle),
+                        content: Text(l.deleteSectionConfirmBody(
+                            viewModel.highlightCells.length)),
                         actions: [
                           TextButton(
-                              child: const Text('キャンセル'),
+                              child: Text(l.cancel),
                               onPressed: () => Navigator.of(ctx).pop()),
                           TextButton(
-                              child: const Text('実行',
-                                  style: TextStyle(color: Colors.red)),
+                              child: Text(l.execute,
+                                  style: const TextStyle(color: Colors.red)),
                               onPressed: () {
                                 Navigator.of(ctx).pop();
                                 showDialog(
@@ -571,7 +580,7 @@ class _DeleteSectionOverlay extends StatelessWidget {
                   },
                 ),
               TextButton(
-                child: const Text('キャンセル'),
+                child: Text(l.cancel),
                 onPressed: () => viewModel.cancelDeleteSectionMode(),
               )
             ],
@@ -621,16 +630,19 @@ class _ProgressDialogContentState extends State<_ProgressDialogContent> {
       // Show completion dialog
       showDialog(
         context: context,
-        builder: (ctx) => AlertDialog(
-          title: const Text('削除完了'),
-          content: const Text('区間の削除が完了しました。'),
-          actions: [
-            TextButton(
-              child: const Text('OK'),
-              onPressed: () => Navigator.of(ctx).pop(),
-            ),
-          ],
-        ),
+        builder: (ctx) {
+          final l = AppLocalizations.of(ctx)!;
+          return AlertDialog(
+            title: Text(l.deleteDoneTitle),
+            content: Text(l.deleteDoneBody),
+            actions: [
+              TextButton(
+                child: Text(l.ok),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+            ],
+          );
+        },
       );
     }
   }
@@ -641,7 +653,7 @@ class _ProgressDialogContentState extends State<_ProgressDialogContent> {
     double progress = (_total > 0) ? _current / _total : 0.0;
 
     return AlertDialog(
-      title: const Text('削除実行中'),
+      title: Text(AppLocalizations.of(context)!.deleteRunningTitle),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         children: [

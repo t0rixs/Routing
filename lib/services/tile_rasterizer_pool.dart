@@ -239,9 +239,42 @@ Uint8List _rasterizeTile(_RasterizeRequest req) {
   final double tileOriginY = tileY * tsD;
   // セルサイズ (度) は z=14 基準の 0.0002 を 2 のべきでスケール。
   final double cellSize = 0.0002 * pow(2, 14 - cellZ).toDouble();
-  // 色計算用の上限値 (main 側の `_calculateCellColor` と一致させる)。
-  final int maxValue = (14 * pow(2, 14 - cellZ)).floor();
+  // 色計算用の上限値とバンド境界 (main 側の `_calculateCellColor` と一致)。
+  final int mult0 = pow(2, 14 - cellZ).floor();
+  final int mult = mult0 < 1 ? 1 : mult0;
+  final int maxValue = 14 * mult;
   final int safeMax = maxValue < 1 ? 1 : maxValue;
+  final int t1 = mult;
+  final int t2 = 2 * mult;
+  final int t3 = 3 * mult;
+
+  // 色 LUT を事前計算 (val=1..safeMax)。式は map_view_model.dart の
+  // `_calculateCellColor` と完全一致させる:
+  //   v ≤ 1*mult           → HSV(255°, 0.85, 0.40)
+  //   1*mult < v ≤ 2*mult  → HSV(255°, 0.95, 0.65)
+  //   2*mult < v ≤ 3*mult  → HSV(255°, 1.00, 1.00)
+  //   3*mult < v ≤ safeMax → 青 → 赤 (HSV 255°→0°) S=V=1
+  final List<_Rgb> colorLut =
+      List<_Rgb>.filled(safeMax + 1, const _Rgb(0, 0, 0));
+  final _Rgb v1Rgb = _hsvToRgb(255.0, 0.85, 0.40);
+  final _Rgb v2Rgb = _hsvToRgb(255.0, 0.95, 0.65);
+  final _Rgb blueRgb = _hsvToRgb(255.0, 1.0, 1.0);
+  for (int v = 1; v <= safeMax; v++) {
+    if (v <= t1) {
+      colorLut[v] = v1Rgb;
+    } else if (v <= t2) {
+      colorLut[v] = v2Rgb;
+    } else if (v <= t3) {
+      colorLut[v] = blueRgb;
+    } else if (safeMax <= t3) {
+      colorLut[v] = blueRgb;
+    } else {
+      final double ratio = (v - t3) / (safeMax - t3);
+      final double hue = 255.0 - ratio * 255.0;
+      colorLut[v] = _hsvToRgb(hue, 1.0, 1.0);
+    }
+  }
+  if (safeMax >= 1) colorLut[0] = colorLut[1];
 
   // --- セルごとに矩形を塗りつぶす -----------------------------------
   final int cellCount = cells.length ~/ 3;
@@ -295,12 +328,9 @@ Uint8List _rasterizeTile(_RasterizeRequest req) {
     if (iBottom > ts) iBottom = ts;
     if (iRight <= iLeft || iBottom <= iTop) continue;
 
-    // 色計算: HSV(255→0, 1, 1.0) を val の割合で。main の
-    // `_calculateCellColor` と同一式を使う (色味を揃えるため)。
-    final double ratio =
-        val.clamp(1, safeMax).toDouble() / safeMax.toDouble();
-    final double hue = 255.0 - ratio * 255.0;
-    final _Rgb rgb = _hsvToRgb(hue, 1.0, 1.0);
+    // 色は事前計算済み LUT から引く。
+    final int vClamped = val < 1 ? 1 : (val > safeMax ? safeMax : val);
+    final _Rgb rgb = colorLut[vClamped];
 
     // 塗りつぶし。行ごとに先頭 offset を計算し、4 バイト単位で書く。
     // Uint8List 直書きは setPixel 系より桁違いに速い。

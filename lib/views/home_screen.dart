@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../generated/l10n/app_localizations.dart';
 import 'map/map_widget_adaptive.dart';
 import 'common/menu_drawer.dart';
 import 'common/background_activity_pill.dart';
@@ -7,9 +8,28 @@ import 'common/banner_ad_widget.dart';
 import 'common/location_always_prompt.dart';
 import 'common/location_rationale_prompt.dart';
 import '../../viewmodels/import_export_view_model.dart';
+import '../../services/update_checker.dart';
 
-class HomeScreen extends StatelessWidget {
+class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> {
+  @override
+  void initState() {
+    super.initState();
+    // 起動時に Play In-App Update を確認（Android リリースビルドのみ実行）。
+    // build 後の最初のフレームで実行することで、SnackBar 表示用の Scaffold が
+    // 確実にツリー上に存在する状態を保証する。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        UpdateChecker.checkAndPromptUpdate(context);
+      }
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -36,6 +56,7 @@ class HomeScreen extends StatelessWidget {
                   // ローディングインジケータ
                   Consumer<ImportExportViewModel>(
                     builder: (context, vm, child) {
+                      final l = AppLocalizations.of(context)!;
                       if (vm.isLoading) {
                         // ファイル展開フェーズ（totalFiles == 0）は進捗率が未確定なので
                         // CircularProgressIndicator（無限スピナー）を表示する。
@@ -52,8 +73,8 @@ class HomeScreen extends StatelessWidget {
                                 child: Column(
                                   mainAxisSize: MainAxisSize.min,
                                   children: [
-                                    const Text('Processing Data...',
-                                        style: TextStyle(
+                                    Text(l.loading,
+                                        style: const TextStyle(
                                             fontSize: 18,
                                             fontWeight: FontWeight.bold)),
                                     const SizedBox(height: 20),
@@ -64,9 +85,9 @@ class HomeScreen extends StatelessWidget {
                                         child: CircularProgressIndicator(),
                                       ),
                                       const SizedBox(height: 16),
-                                      const Text(
-                                        'ファイルを展開中...',
-                                        style: TextStyle(fontSize: 14),
+                                      Text(
+                                        l.extractingFiles,
+                                        style: const TextStyle(fontSize: 14),
                                       ),
                                     ] else ...[
                                       LinearProgressIndicator(

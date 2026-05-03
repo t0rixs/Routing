@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 import 'package:provider/provider.dart';
 
+import '../../generated/l10n/app_localizations.dart';
 import '../../viewmodels/map_view_model.dart';
 
 /// マップ画面の上部に重ねて表示する日付フィルタチップ。
@@ -62,16 +63,17 @@ class DateFilterChip extends StatelessWidget {
                 InkWell(
                   borderRadius: BorderRadius.circular(16),
                   onTap: () async {
+                    final l = AppLocalizations.of(context)!;
                     final picked = await showDateRangePicker(
                       context: context,
                       firstDate: DateTime(2015),
                       lastDate: DateTime(today.year + 1, 12, 31),
                       initialDateRange:
                           DateTimeRange(start: start, end: end),
-                      helpText: '日付で絞り込み',
-                      saveText: '適用',
-                      cancelText: 'キャンセル',
-                      confirmText: 'OK',
+                      helpText: l.dateFilterHelp,
+                      saveText: l.dateFilterApply,
+                      cancelText: l.cancel,
+                      confirmText: l.ok,
                     );
                     if (picked != null) {
                       vm.setDateFilter(

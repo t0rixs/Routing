@@ -2,7 +2,7 @@ name: routing
 description: "Make your life map."
 publish_to: "none"
 
-version: 0.0.1+7
+version: 0.1.5+12
 
 environment:
   sdk: ">=3.0.0 <4.0.0"
@@ -26,13 +26,17 @@ dependencies:
   archive: ^3.3.1
   shared_preferences: ^2.0.15
   flutter_svg: ^2.0.10+1
-  intl: ^0.18.1
+  intl: any
+  flutter_localizations:
+    sdk: flutter
+  country_flags: ^3.2.0
   flutter_background_service: ^5.0.5
   dio: ^5.9.0
   flutter_local_notifications: ^19.5.0
   share_plus: ^10.0.0
   image: ^4.3.0
   google_mobile_ads: ^5.2.0
+  in_app_update: ^4.2.5
   
 dev_dependencies:
   flutter_test:
@@ -41,6 +45,7 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  generate: true
   assets:
     - assets/mapstyle.json
 

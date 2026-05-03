@@ -18,7 +18,37 @@ import '../services/background_activity_service.dart';
 import '../utils/cell_index.dart';
 
 /// マップの表示状態とデータロードを管理するViewModel
-class MapViewModel extends ChangeNotifier {
+class MapViewModel extends ChangeNotifier with WidgetsBindingObserver {
+  MapViewModel() {
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    disposeLocationRecording();
+    super.dispose();
+  }
+
+  /// アプリがバックグラウンド（paused/inactive/hidden/detached）にあるか。
+  /// 位置記録は継続するが、UI 再計算・タイル再生成・stats 集計は抑止する。
+  bool _appInBackground = false;
+  bool get appInBackground => _appInBackground;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    final bool wasInBackground = _appInBackground;
+    _appInBackground = state != AppLifecycleState.resumed;
+    if (wasInBackground && !_appInBackground) {
+      // フォアグラウンド復帰時: BG 中に蓄積された記録を 1 回だけ反映する。
+      // - HUD の数値を最新化
+      // - タイルを作り直して BG で記録された cell を可視化
+      refreshTotalStats(immediate: true);
+      _refreshTileOverlay();
+    }
+  }
+
   final DatabaseRepository _databaseRepository = DatabaseRepository();
 
   // SharedPreferences のキー（カメラ位置の保存／復元に使用）
@@ -105,6 +135,20 @@ class MapViewModel extends ChangeNotifier {
   /// 細かい表示項目のトグルは `_styleOverrides` で管理する（設定画面から変更）。
   MapBaseStyle _mapBaseStyle = MapBaseStyle.standard;
   MapBaseStyle get mapBaseStyle => _mapBaseStyle;
+
+  /// 現在の UI テーマがダークかどうか。`cycleMapBaseStyle` で「通常」へ戻すときに
+  /// `standard` ではなく `dark` を選ぶための判断材料。
+  /// `_loadMapBaseStyle` で SharedPreferences から復元され、メニューでテーマが
+  /// 切り替わると [syncThemeIsDark] 経由で更新される。
+  bool _themeIsDark = false;
+
+  /// 外部（メニュー UI）から UI テーマの変更を通知する。
+  /// マップのベーススタイル自体はここでは触らず、`cycleMapBaseStyle` の挙動に
+  /// 影響するだけ（メニューは別途 `setMapBaseStyle` を呼んでいる）。
+  void syncThemeIsDark(bool isDark) {
+    if (_themeIsDark == isDark) return;
+    _themeIsDark = isDark;
+  }
 
   /// ベーススタイルに重ねる個別トグル設定。
   MapStyleOverrides _styleOverrides = const MapStyleOverrides();
@@ -289,6 +333,10 @@ class MapViewModel extends ChangeNotifier {
 
   /// 画面右下のマップスタイル切替ボタン用: 衛星 → 白紙 → 通常 を循環。
   /// 細かい dark テーマや POI トグルは設定画面側で扱う。
+  ///
+  /// 「通常」位置は現在の UI テーマに連動する。ダークテーマ ON 中は dark を、
+  /// それ以外は standard を選ぶ。これによりダークテーマ中に循環しても地図が
+  /// ライトに戻らない。
   void cycleMapBaseStyle() {
     final MapBaseStyle next;
     switch (_mapBaseStyle) {
@@ -296,7 +344,7 @@ class MapViewModel extends ChangeNotifier {
         next = MapBaseStyle.blank;
         break;
       case MapBaseStyle.blank:
-        next = MapBaseStyle.standard;
+        next = _themeIsDark ? MapBaseStyle.dark : MapBaseStyle.standard;
         break;
       case MapBaseStyle.standard:
       case MapBaseStyle.dark:
@@ -349,6 +397,17 @@ class MapViewModel extends ChangeNotifier {
       final idx = prefs.getInt(_kPrefMapBaseStyle);
       if (idx != null && idx >= 0 && idx < MapBaseStyle.values.length) {
         _mapBaseStyle = MapBaseStyle.values[idx];
+      }
+      // ThemeController の保存値（'app_theme_mode'）と地図ベーススタイルを同期する。
+      // 例: ユーザがメニューでダークを ON → その後右下 FAB で地図を循環 (satellite→blank→standard)
+      // させると、テーマは dark のままだが地図は standard で保存され、再起動時に不整合となる。
+      // ここで「テーマ=dark なのに地図=standard」「テーマ=light なのに地図=dark」のズレを補正する。
+      final themeStr = prefs.getString('app_theme_mode');
+      _themeIsDark = themeStr == 'dark';
+      if (_themeIsDark && _mapBaseStyle == MapBaseStyle.standard) {
+        _mapBaseStyle = MapBaseStyle.dark;
+      } else if (!_themeIsDark && _mapBaseStyle == MapBaseStyle.dark) {
+        _mapBaseStyle = MapBaseStyle.standard;
       }
       final ojson = prefs.getString(_kPrefOverridesJson);
       if (ojson != null && ojson.isNotEmpty) {
@@ -550,6 +609,12 @@ class MapViewModel extends ChangeNotifier {
   /// ストリーム用（タイムアウトなし）。
   /// Android は foreground service を起動してバックグラウンドでも位置を受信する。
   /// iOS は後続対応予定（現状はフォアグラウンドのみ）。
+  ///
+  /// バッテリー消費はここではなく `_recordCellsForMovement` 以降の
+  /// UI/タイル再生成パスが主因だったため、本設定はユーザー要件どおり
+  /// 1 秒間隔・距離フィルタなしの高頻度サンプリングに戻している。
+  /// バックグラウンド時は `_appInBackground` ガードで UI 系の処理を全て
+  /// 抑止しているので、高頻度サンプリングしても CPU 消費は小さい。
   LocationSettings _streamLocationSettings() {
     switch (defaultTargetPlatform) {
       case TargetPlatform.android:
@@ -693,6 +758,8 @@ class MapViewModel extends ChangeNotifier {
     if (previous != null) {
       unawaited(_recordCellsForMovement(previous, current));
     }
+    // BG 中は UI 再計算を行わない（不可視ウィジェットの rebuild を避ける）。
+    if (_appInBackground) return;
     if (_followUser) {
       _followTick++;
       notifyListeners();
@@ -738,6 +805,12 @@ class MapViewModel extends ChangeNotifier {
     } finally {
       BackgroundActivityService.instance.end();
     }
+    // ===== ここから先は UI/可視化の更新。BG 中はすべてスキップ =====
+    // BG 中はマップが見えないので、stats 集計やタイル再生成、ハイライト
+    // 判定などをすべて省略し、CPU/IO/wakeup を最小化する。
+    // 復帰時に `didChangeAppLifecycleState` で 1 回だけまとめて反映する。
+    if (_appInBackground) return;
+
     // HUD 統計を更新（デバウンスされるので連続記録でも負荷は限定的）。
     refreshTotalStats();
 
@@ -1461,16 +1534,43 @@ class MapViewModel extends ChangeNotifier {
 
     // 色 LUT。val の上限値 safeMax までを 1 度だけ HSV→RGB 変換してキャッシュ。
     // 本来は 1 セルずつ `HSVColor.fromAHSV(...).toColor()` を呼んでいた。
-    final int maxValue = 14 * (1 << cellShift);
+    final int mult = (1 << cellShift) < 1 ? 1 : (1 << cellShift);
+    final int maxValue = 14 * mult;
     final int safeMax = maxValue < 1 ? 1 : maxValue;
     // LUT は 32-bit ARGB。
     final Int32List colorLut = Int32List(safeMax + 1);
-    // val=0 は存在しない想定だが、念のため val=1 の色を入れる。
+    // 計算式は `_calculateCellColor` と完全一致させる:
+    //   v ≤ 1*mult           → HSV(255°, 0.85, 0.40)
+    //   1*mult < v ≤ 2*mult  → HSV(255°, 0.95, 0.65)
+    //   2*mult < v ≤ 3*mult  → HSV(255°, 1.00, 1.00)
+    //   3*mult < v ≤ safeMax → 青 → 赤 (HSV 255°→0°) S=V=1
+    // ignore: deprecated_member_use
+    final int v1Argb =
+        HSVColor.fromAHSV(1.0, 255.0, 0.85, 0.40).toColor().value;
+    // ignore: deprecated_member_use
+    final int v2Argb =
+        HSVColor.fromAHSV(1.0, 255.0, 0.95, 0.65).toColor().value;
+    // ignore: deprecated_member_use
+    final int blueArgb =
+        HSVColor.fromAHSV(1.0, 255.0, 1.0, 1.0).toColor().value;
+    final int t1 = mult;
+    final int t2 = 2 * mult;
+    final int t3 = 3 * mult;
     for (int v = 1; v <= safeMax; v++) {
-      final double ratio = v / safeMax;
-      final double hue = 255 - (ratio * 255);
-      // ignore: deprecated_member_use
-      colorLut[v] = HSVColor.fromAHSV(1.0, hue, 1.0, 1.0).toColor().value;
+      if (v <= t1) {
+        colorLut[v] = v1Argb;
+      } else if (v <= t2) {
+        colorLut[v] = v2Argb;
+      } else if (v <= t3) {
+        colorLut[v] = blueArgb;
+      } else if (safeMax <= t3) {
+        colorLut[v] = blueArgb;
+      } else {
+        final double ratio = (v - t3) / (safeMax - t3);
+        final double hue = 255.0 - ratio * 255.0;
+        // ignore: deprecated_member_use
+        colorLut[v] = HSVColor.fromAHSV(1.0, hue, 1.0, 1.0).toColor().value;
+      }
     }
     colorLut[0] = colorLut[1];
 
@@ -1614,17 +1714,42 @@ class MapViewModel extends ChangeNotifier {
   }
 
   /// セルの色を計算
+  ///
+  /// 訪問回数 (cellValue) を以下の段階で色付けする (全段階で不透明度 100%)。
+  /// 境界はズームレベルに応じて `mult = 2^(14-cellZ)` でスケールする。
+  /// v=1, v=2 は HSV の彩度・明度を段階的に上げて v=3 (純粋な青) へ繋げる。
+  /// （RGB lerp で白っぽいグレーを介すと彩度が落ちて違和感が出るため避ける）。
+  ///   v ≤ 1*mult           → HSV(255°, 0.85, 0.40)  深いネイビー
+  ///   1*mult < v ≤ 2*mult  → HSV(255°, 0.95, 0.65)  中間の青
+  ///   2*mult < v ≤ 3*mult  → HSV(255°, 1.00, 1.00)  純粋な青
+  ///   3*mult < v ≤ safeMax → 青 → 赤 (HSV 255°→0°) に線形補間 (S=V=1)
+  ///
+  /// 計算式は `tile_rasterizer_pool.dart` および本ファイル内の色 LUT 生成
+  /// (`refreshTileOverlay` 周辺) と必ず揃えること。
   Color _calculateCellColor(int cellValue, int cellZ) {
-    final maxValue = (14 * pow(2, 14 - cellZ)).floor();
-    // clampして0割回避
-    final safeMax = maxValue < 1 ? 1 : maxValue;
-    final double ratio = cellValue.clamp(1, safeMax).toDouble() / safeMax;
-    // ratio 0.0 -> Hue 255 (Blue/Purple)
-    // ratio 1.0 -> Hue 0 (Red)
-    final double hue = 255 - (ratio * 255);
-    return HSVColor.fromAHSV(1.0, hue, 1.0, 1.0)
-        .toColor()
-        .withValues(alpha: 1); // 透過度調整
+    final int mult0 = pow(2, 14 - cellZ).floor();
+    final int mult = mult0 < 1 ? 1 : mult0;
+    final int safeMax0 = 14 * mult;
+    final int safeMax = safeMax0 < 1 ? 1 : safeMax0;
+    final int v = cellValue.clamp(1, safeMax);
+    final int t1 = mult;
+    final int t2 = 2 * mult;
+    final int t3 = 3 * mult;
+    if (v <= t1) {
+      return HSVColor.fromAHSV(1.0, 255.0, 0.85, 0.40).toColor();
+    }
+    if (v <= t2) {
+      return HSVColor.fromAHSV(1.0, 255.0, 0.95, 0.65).toColor();
+    }
+    if (v <= t3) {
+      return HSVColor.fromAHSV(1.0, 255.0, 1.0, 1.0).toColor();
+    }
+    if (safeMax <= t3) {
+      return HSVColor.fromAHSV(1.0, 255.0, 1.0, 1.0).toColor();
+    }
+    final double ratio = (v - t3) / (safeMax - t3);
+    final double hue = 255.0 - ratio * 255.0;
+    return HSVColor.fromAHSV(1.0, hue, 1.0, 1.0).toColor();
   }
 
   Future<Cell?> onTap(LatLng latLng) async {

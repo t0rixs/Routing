@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../../generated/l10n/app_localizations.dart';
 import '../../viewmodels/map_view_model.dart';
 
 /// アプリ起動直後、OS の位置情報許可ダイアログを出す前に表示する事前説明
@@ -42,32 +43,30 @@ class _LocationRationalePromptState extends State<LocationRationalePrompt> {
 
   Future<void> _showDialog(BuildContext context, MapViewModel vm) async {
     if (!context.mounted) return;
+    final l = AppLocalizations.of(context)!;
     await showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (ctx) => AlertDialog(
-        title: const Text('位置情報の利用について'),
-        content: const SingleChildScrollView(
+        title: Text(l.locationRationaleTitle),
+        content: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(
-                'このアプリはローカルに移動ログを保存するため、'
-                'バックグラウンドで位置情報を使用します。',
-                style: TextStyle(fontSize: 15),
+                l.locationRationaleBody1,
+                style: const TextStyle(fontSize: 15),
               ),
-              SizedBox(height: 12),
+              const SizedBox(height: 12),
               Text(
-                '取得した位置情報はあなたの端末内にのみ保存され、'
-                'サーバには送信されません。',
-                style: TextStyle(fontSize: 13, color: Colors.black54),
+                l.locationRationaleBody2,
+                style: const TextStyle(fontSize: 13, color: Colors.black54),
               ),
-              SizedBox(height: 12),
+              const SizedBox(height: 12),
               Text(
-                '次に OS の許可ダイアログが表示されます。'
-                'バックグラウンドでも記録するためには「常に許可」を選択してください。',
-                style: TextStyle(fontSize: 13, color: Colors.black54),
+                l.locationRationaleBody3,
+                style: const TextStyle(fontSize: 13, color: Colors.black54),
               ),
             ],
           ),
@@ -77,7 +76,7 @@ class _LocationRationalePromptState extends State<LocationRationalePrompt> {
             onPressed: () {
               Navigator.of(ctx).pop();
             },
-            child: const Text('OK（続ける）'),
+            child: Text(l.continueAction),
           ),
         ],
       ),

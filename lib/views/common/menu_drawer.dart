@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:file_picker/file_picker.dart';
+import '../../generated/l10n/app_localizations.dart';
 import '../../repositories/database_repository.dart';
 import '../../viewmodels/import_export_view_model.dart';
 import '../../viewmodels/map_view_model.dart';
@@ -16,15 +17,16 @@ class MenuDrawer extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final bool isDark = Theme.of(context).brightness == Brightness.dark;
+    final l = AppLocalizations.of(context)!;
     return Drawer(
       backgroundColor: isDark ? Colors.black : null,
       child: ListView(
         padding: EdgeInsets.zero,
         children: [
-          const DrawerHeader(
-            decoration: BoxDecoration(color: Colors.blue),
-            child: Text('Routing Menu',
-                style: TextStyle(color: Colors.white, fontSize: 24)),
+          DrawerHeader(
+            decoration: const BoxDecoration(color: Colors.blue),
+            child: Text(l.appTitle,
+                style: const TextStyle(color: Colors.white, fontSize: 24)),
           ),
           // 位置情報記録の ON/OFF スイッチ。
           // OFF にすると GPS 購読を止め、foreground service 通知も消える。
@@ -37,8 +39,8 @@ class MenuDrawer extends StatelessWidget {
                   on ? Icons.fiber_manual_record : Icons.stop_circle_outlined,
                   color: on ? Colors.red : null,
                 ),
-                title: const Text('位置情報を記録'),
-                subtitle: Text(on ? '記録中（タップで停止）' : '停止中（タップで再開）'),
+                title: Text(l.menuRecordLocation),
+                subtitle: Text(on ? l.menuRecording : l.menuStopped),
                 value: on,
                 onChanged: (v) async {
                   if (v) {
@@ -174,15 +176,15 @@ class MenuDrawer extends StatelessWidget {
             builder: (context, vm, _) {
               return ExpansionTile(
                 leading: const Icon(Icons.hd),
-                title: const Text('タイル解像度'),
-                subtitle: Text(_resolutionLabel(vm.tileResolution)),
+                title: Text(l.menuTileResolution),
+                subtitle: Text(_resolutionLabel(vm.tileResolution, l)),
                 children: [
                   for (final int ts in MapViewModel.tileResolutionOptions)
                     ListTile(
                       dense: true,
                       contentPadding:
                           const EdgeInsets.only(left: 72, right: 16),
-                      title: Text(_resolutionLabel(ts)),
+                      title: Text(_resolutionLabel(ts, l)),
                       trailing: vm.tileResolution == ts
                           ? const Icon(Icons.check, color: Colors.blue)
                           : null,
@@ -202,11 +204,12 @@ class MenuDrawer extends StatelessWidget {
                 secondary: Icon(
                   isDark ? Icons.dark_mode : Icons.light_mode,
                 ),
-                title: const Text('ダークモード'),
-                subtitle: Text(isDark ? 'ダーク（UI＋マップ）' : 'ライト（UI＋マップ）'),
+                title: Text(l.menuDarkMode),
+                subtitle: Text(isDark ? l.menuDarkModeOn : l.menuDarkModeOff),
                 value: isDark,
                 onChanged: (v) {
                   themeCtrl.setThemeMode(v ? ThemeMode.dark : ThemeMode.light);
+                  vm.syncThemeIsDark(v);
                   vm.setMapBaseStyle(
                     v ? MapBaseStyle.dark : MapBaseStyle.standard,
                   );
@@ -217,8 +220,8 @@ class MenuDrawer extends StatelessWidget {
           // マップ表示の詳細設定（別画面へ遷移）
           ListTile(
             leading: const Icon(Icons.tune),
-            title: const Text('マップ表示の詳細設定'),
-            subtitle: const Text('ランドマーク・駅・路線などを個別に切替'),
+            title: Text(l.menuMapStyleSettings),
+            subtitle: Text(l.menuMapStyleSettingsSubtitle),
             onTap: () {
               Navigator.pop(context); // drawer を閉じる
               Navigator.of(context).push(
@@ -233,8 +236,8 @@ class MenuDrawer extends StatelessWidget {
           // 旧バージョンで z=14 しか記録していなかった DB を修復するため。
           ListTile(
             leading: const Icon(Icons.layers),
-            title: const Text('低ズーム描画を再構築'),
-            subtitle: const Text('z=14 の記録から z=3..13 を作り直します'),
+            title: Text(l.menuRebuildLowZoom),
+            subtitle: Text(l.menuRebuildSubtitle),
             onTap: () async {
               final mapVm =
                   Provider.of<MapViewModel>(context, listen: false);
@@ -244,18 +247,16 @@ class MenuDrawer extends StatelessWidget {
               final confirmed = await showDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
-                  title: const Text('低ズーム描画を再構築'),
-                  content: const Text(
-                      'z=3..13 のデータを z=14 から作り直します。記録データ（z=14）は変更されません。\n'
-                      '完了まで数十秒〜数分かかる場合があります。'),
+                  title: Text(l.menuRebuildLowZoom),
+                  content: Text(l.menuRebuildLowZoomBody),
                   actions: [
                     TextButton(
                       onPressed: () => Navigator.of(ctx).pop(false),
-                      child: const Text('キャンセル'),
+                      child: Text(l.cancel),
                     ),
                     TextButton(
                       onPressed: () => Navigator.of(ctx).pop(true),
-                      child: const Text('実行'),
+                      child: Text(l.execute),
                     ),
                   ],
                 ),
@@ -271,7 +272,7 @@ class MenuDrawer extends StatelessWidget {
                 context: navigator.context,
                 barrierDismissible: false,
                 builder: (ctx) => AlertDialog(
-                  title: const Text('再構築中...'),
+                  title: Text(l.menuRebuildInProgress),
                   content: ValueListenableBuilder<(int, int)>(
                     valueListenable: progress,
                     builder: (_, v, __) {
@@ -284,8 +285,8 @@ class MenuDrawer extends StatelessWidget {
                           LinearProgressIndicator(value: frac),
                           const SizedBox(height: 12),
                           Text(t > 0
-                              ? '$p / $t shards'
-                              : 'z=14 shard を走査中...'),
+                              ? l.menuRebuildShards(p, t)
+                              : l.menuRebuildScanning),
                         ],
                       );
                     },
@@ -298,12 +299,12 @@ class MenuDrawer extends StatelessWidget {
                   onProgress: (p, t) => progress.value = (p, t),
                 );
                 if (navigator.canPop()) navigator.pop(); // close progress
-                messenger.showSnackBar(const SnackBar(
-                    content: Text('低ズーム描画の再構築が完了しました')));
+                messenger.showSnackBar(SnackBar(
+                    content: Text(l.menuRebuildSuccess)));
               } catch (e) {
                 if (navigator.canPop()) navigator.pop();
                 messenger.showSnackBar(SnackBar(
-                    content: Text('再構築に失敗: $e'),
+                    content: Text(l.menuRebuildFailed(e.toString())),
                     backgroundColor: Colors.red));
               } finally {
                 progress.dispose();
@@ -313,9 +314,9 @@ class MenuDrawer extends StatelessWidget {
           const Divider(),
           ListTile(
             leading: const Icon(Icons.delete_forever, color: Colors.red),
-            title: const Text('全記録をクリア',
-                style: TextStyle(color: Colors.red)),
-            subtitle: const Text('すべての DB を削除します'),
+            title: Text(l.menuClearAll,
+                style: const TextStyle(color: Colors.red)),
+            subtitle: Text(l.menuClearAllSubtitle),
             onTap: () async {
               final mapVm =
                   Provider.of<MapViewModel>(context, listen: false);
@@ -326,18 +327,17 @@ class MenuDrawer extends StatelessWidget {
               final confirmed = await showDialog<bool>(
                 context: context,
                 builder: (ctx) => AlertDialog(
-                  title: const Text('全記録をクリア'),
-                  content: const Text(
-                      '記録済みのデータを全て削除します。この操作は取り消せません。よろしいですか？'),
+                  title: Text(l.menuClearAll),
+                  content: Text(l.menuClearAllConfirmBody),
                   actions: [
                     TextButton(
                       onPressed: () => Navigator.of(ctx).pop(false),
-                      child: const Text('キャンセル'),
+                      child: Text(l.cancel),
                     ),
                     TextButton(
                       onPressed: () => Navigator.of(ctx).pop(true),
-                      child: const Text('削除する',
-                          style: TextStyle(color: Colors.red)),
+                      child: Text(l.delete,
+                          style: const TextStyle(color: Colors.red)),
                     ),
                   ],
                 ),
@@ -351,12 +351,12 @@ class MenuDrawer extends StatelessWidget {
               try {
                 await DatabaseRepository().clearAllData();
                 messenger.showSnackBar(
-                  const SnackBar(content: Text('全ての記録を削除しました')),
+                  SnackBar(content: Text(l.menuClearAllDone)),
                 );
               } catch (e) {
                 messenger.showSnackBar(
                   SnackBar(
-                      content: Text('削除失敗: $e'),
+                      content: Text(l.menuClearAllFailed(e.toString())),
                       backgroundColor: Colors.red),
                 );
               } finally {
@@ -372,14 +372,14 @@ class MenuDrawer extends StatelessWidget {
     );
   }
 
-  static String _resolutionLabel(int ts) {
+  static String _resolutionLabel(int ts, AppLocalizations l) {
     switch (ts) {
       case 320:
-        return '低 (320px)';
+        return l.tileResLow;
       case 480:
-        return '中 (480px)';
+        return l.tileResMid;
       case 512:
-        return '高 (512px)';
+        return l.tileResHigh;
       default:
         return '${ts}px';
     }
